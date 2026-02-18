@@ -462,11 +462,15 @@ if (autoCompanion && !(await isCompanionRunning())) {
 
   const compPort = new URL(companionUrl).port || "3457";
   const npxCmd = IS_WIN ? "npx.cmd" : "npx";
-  companionProcess = spawn(npxCmd, ["the-vibe-companion", "--port", compPort], {
-    stdio: "ignore",
-    detached: !IS_WIN,
-    shell: IS_WIN,
-  });
+  companionProcess = spawn(
+    npxCmd,
+    ["--yes", "the-vibe-companion", "--port", compPort],
+    {
+      stdio: "ignore",
+      detached: !IS_WIN,
+      shell: IS_WIN,
+    },
+  );
   companionProcess.unref();
 
   let ready = false;
