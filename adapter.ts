@@ -67,7 +67,7 @@ const TOOL_MODE = (process.env.TOOL_MODE ?? "auto") as "auto" | "passthrough";
 type ContextStrategyType = "none" | "summary" | "stateful" | "hybrid";
 const VALID_STRATEGIES: ContextStrategyType[] = ["none", "summary", "stateful", "hybrid"];
 
-// Mutable — can be changed at runtime via /context chat command or API
+// Mutable — can be changed at runtime via /bridge chat command or API
 let CONTEXT_STRATEGY: ContextStrategyType =
   (process.env.CONTEXT_STRATEGY ?? "summary") as ContextStrategyType;
 
@@ -331,7 +331,7 @@ type CompanionMsg =
 
 interface OAIChatMessage {
   role: string;
-  content: string | null;
+  content: string | { type: string; text?: string }[] | null;
   tool_calls?: OAIToolCall[];
   tool_call_id?: string;
 }
@@ -1299,6 +1299,23 @@ const contextMgr = new ContextManager();
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Extract plain text from an OAI message's content field.
+ * OpenClaw sends content as an array of blocks: [{type: "text", text: "..."}]
+ * while simpler clients send a plain string. This normalizes both to string.
+ */
+function extractTextContent(
+  content: string | { type: string; text?: string }[] | null,
+): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  // Array of content blocks — concatenate all text blocks
+  return content
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text!)
+    .join("\n");
+}
+
+/**
  * Derive a deterministic session key from the request.
  * Priority: X-Session-Key header > model name > "default"
  *
@@ -1355,7 +1372,7 @@ function extractToolResults(
   return msgs
     .filter((m) => m.role === "tool" && m.tool_call_id)
     .map((m) => {
-      const content = (m.content ?? "").trim();
+      const content = extractTextContent(m.content).trim();
       const approved = APPROVAL_WORDS.has(
         content.toLowerCase().replace(/[^a-z]/g, ""),
       );
@@ -1806,9 +1823,12 @@ Bun.serve({
       }
 
       // ── Extract the user's prompt ──────────────────────────────
-      let prompt = body.messages
+      // Content can be a plain string OR an array of content blocks
+      // (OpenClaw sends [{type: "text", text: "..."}]). Normalize to string.
+      const rawContent = body.messages
         .filter((m) => m.role === "user")
         .at(-1)?.content;
+      let prompt = extractTextContent(rawContent);
       if (!prompt) {
         return Response.json(
           {
@@ -1821,21 +1841,21 @@ Bun.serve({
         );
       }
 
-      // ── /context commands — runtime context strategy control ────
+      // ── /bridge commands — runtime context strategy control ────
       //
       // Intercepts chat commands so you can switch strategies mid-session:
-      //   /context summary      → switch to rolling summary mode
-      //   /context stateful     → switch to external state mode
-      //   /context hybrid       → switch to both
-      //   /context none         → disable context persistence
-      //   /context status       → show current strategy + context health
-      //   /context compact      → force a summary compaction now
-      //   /context checkpoint   → force a state file write now
-      //   /context reset        → destroy session, start fresh (keeps files)
+      //   /bridge summary      → switch to rolling summary mode
+      //   /bridge stateful     → switch to external state mode
+      //   /bridge hybrid       → switch to both
+      //   /bridge none         → disable context persistence
+      //   /bridge status       → show current strategy + context health
+      //   /bridge compact      → force a summary compaction now
+      //   /bridge checkpoint   → force a state file write now
+      //   /bridge reset        → destroy session, start fresh (keeps files)
       //
-      const trimmedPrompt = prompt.trim().toLowerCase();
-      if (trimmedPrompt.startsWith("/context")) {
-        const arg = trimmedPrompt.replace("/context", "").trim().split(/\s+/)[0];
+      const trimmedPrompt = String(prompt).trim().toLowerCase();
+      if (trimmedPrompt.startsWith("/bridge")) {
+        const arg = trimmedPrompt.replace("/bridge", "").trim().split(/\s+/)[0];
 
         // ── Switch strategy ──
         if (VALID_STRATEGIES.includes(arg as ContextStrategyType)) {
@@ -1896,16 +1916,16 @@ Bun.serve({
 
         // ── Help ──
         const helpMsg = [
-          "**Available /context commands:**",
+          "**Available /bridge commands:**",
           "",
-          "`/context status` — show current strategy + context health",
-          "`/context summary` — switch to rolling summary mode",
-          "`/context stateful` — switch to external state file mode",
-          "`/context hybrid` — use both summary + state files",
-          "`/context none` — disable context persistence",
-          "`/context compact` — force summary compaction on next turn",
-          "`/context checkpoint` — force state checkpoint on next turn",
-          "`/context reset` — kill session, start fresh (keeps context files)",
+          "`/bridge status` — show current strategy + context health",
+          "`/bridge summary` — switch to rolling summary mode",
+          "`/bridge stateful` — switch to external state file mode",
+          "`/bridge hybrid` — use both summary + state files",
+          "`/bridge none` — disable context persistence",
+          "`/bridge compact` — force summary compaction on next turn",
+          "`/bridge checkpoint` — force state checkpoint on next turn",
+          "`/bridge reset` — kill session, start fresh (keeps context files)",
         ].join("\n");
         return formatCommandResponse(helpMsg, session, CORS, wantStream);
       }

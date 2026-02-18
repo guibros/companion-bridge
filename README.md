@@ -79,7 +79,7 @@ No OpenClaw? No problem — the bridge works as a standalone OpenAI-compatible s
 
 > **New in v3.1** — Survive context window limits and session resets without losing your work.
 
-When Claude Code's context window fills up, the adapter can automatically preserve conversational context across session boundaries. Three strategies are available, configurable via `CONTEXT_STRATEGY` or switchable live via `/context` chat commands.
+When Claude Code's context window fills up, the adapter can automatically preserve conversational context across session boundaries. Three strategies are available, configurable via `CONTEXT_STRATEGY` or switchable live via `/bridge` chat commands.
 
 ### Strategies
 
@@ -119,19 +119,19 @@ The adapter tracks context fill percentage and warns in the SSE stream:
 95%  🔴 Context at 95%! Session reset imminent
 ```
 
-### `/context` Chat Commands
+### `/bridge` Chat Commands
 
 Switch strategies and manage context without restarting the bridge — just type in your chat:
 
 ```
-/context status       Show current strategy + context health
-/context summary      Switch to rolling summary mode
-/context stateful     Switch to external state file mode
-/context hybrid       Use both summary + state files
-/context none         Disable context persistence
-/context compact      Force summary compaction on next turn
-/context checkpoint   Force state checkpoint on next turn
-/context reset        Kill session, start fresh (keeps context files)
+/bridge status       Show current strategy + context health
+/bridge summary      Switch to rolling summary mode
+/bridge stateful     Switch to external state file mode
+/bridge hybrid       Use both summary + state files
+/bridge none         Disable context persistence
+/bridge compact      Force summary compaction on next turn
+/bridge checkpoint   Force state checkpoint on next turn
+/bridge reset        Kill session, start fresh (keeps context files)
 ```
 
 These are intercepted by the adapter before reaching the CLI — zero token cost, instant response.
@@ -186,7 +186,7 @@ git clone https://github.com/guibros/companion-bridge.git && cd companion-bridge
 - **Cross-platform** — Windows, macOS, Linux
 - **Session pooling** — persistent Claude Code sessions keyed by model
 - **Context persistence** — rolling summary, external state files, or hybrid mode to survive session resets
-- **Runtime `/context` commands** — switch strategies, force checkpoints, check context health mid-session
+- **Runtime `/bridge` commands** — switch strategies, force checkpoints, check context health mid-session
 - **Context window tracking** — percentage-based warnings at 50/70/85/95% fill
 - **Real-time SSE** — tool activity, thinking status, text deltas
 - **SSE heartbeats** — no client timeouts on long tasks
@@ -247,11 +247,11 @@ git clone https://github.com/guibros/companion-bridge.git && cd companion-bridge
 - Context window fill tracking with SSE warnings at 50/70/85/95%
 - Automatic context recovery from disk on session reset
 
-**Runtime `/context` commands (new):**
-- Switch strategies mid-session without restarting (`/context hybrid`)
-- Check context health (`/context status`)
-- Force compaction or state checkpoint (`/context compact`, `/context checkpoint`)
-- Manual session reset preserving context files (`/context reset`)
+**Runtime `/bridge` commands (new):**
+- Switch strategies mid-session without restarting (`/bridge hybrid`)
+- Check context health (`/bridge status`)
+- Force compaction or state checkpoint (`/bridge compact`, `/bridge checkpoint`)
+- Manual session reset preserving context files (`/bridge reset`)
 - Commands intercepted before CLI — zero token cost
 
 ### v3.0.0
