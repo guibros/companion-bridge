@@ -1,6 +1,6 @@
 {
   "name": "companion-bridge",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "OpenAI-compatible adapter for Claude Code CLI. One command: npx companion-bridge",
   "type": "module",
   "bin": {
@@ -17,10 +17,21 @@
     "README.md"
   ],
   "keywords": [
-    "claude-code", "openai", "adapter", "companion",
-    "openclaw", "bridge", "claude", "anthropic", "llm"
+    "claude-code",
+    "openai",
+    "adapter",
+    "companion",
+    "openclaw",
+    "bridge",
+    "claude",
+    "anthropic",
+    "llm"
   ],
-  "os": ["darwin", "linux", "win32"],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
