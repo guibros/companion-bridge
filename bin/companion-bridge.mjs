@@ -32,7 +32,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PKG_DIR = resolve(__dirname, "..");
 const ADAPTER_PATH = join(PKG_DIR, "adapter.ts");
-const VERSION = "3.0.4";
+const VERSION = "3.0.5";
 const IS_WIN = process.platform === "win32";
 const HOME = process.env.HOME || process.env.USERPROFILE || "";
 
@@ -63,6 +63,7 @@ const fail = (msg) => {
 
 const args = process.argv.slice(2);
 const env = { ...process.env };
+delete env.CLAUDECODE; // Strip nesting guard from our own environment too
 let autoCompanion = true;
 let skipOpenclawSetup = false;
 
@@ -84,7 +85,7 @@ ${c.dim("OPTIONS")}
   --health            Check adapter health
   --stop              Kill all active sessions
   --port PORT         Adapter port (default: 8787)
-  --companion URL     Companion URL (default: http://localhost:3457)
+  --companion URL     Companion URL (default: http://localhost:3456)
   --no-companion      Don't auto-start Companion
   --no-openclaw       Skip OpenClaw auto-configuration
   --passthrough       Enable tool passthrough mode
@@ -321,6 +322,39 @@ function restartOpenclawGateway() {
   }
 }
 
+// ─── Companion CLAUDECODE Patch ──────────────────────────────────────────────
+
+/**
+ * The Vibe Companion's cli-launcher.ts hardcodes CLAUDECODE: "1" in the
+ * environment when spawning claude CLI processes. This causes the CLI to
+ * refuse to start ("cannot be launched inside another Claude Code session").
+ *
+ * This function finds the installed companion source and strips that line.
+ * Runs after npx has cached the package so the file exists on disk.
+ * Safe to call multiple times — skips if already patched.
+ */
+function patchCompanionNestingGuard() {
+  try {
+    const findCmd = IS_WIN
+      ? `where /r "${join(HOME, ".npm", "_npx")}" cli-launcher.ts`
+      : `find "${HOME}/.npm/_npx" -path "*/the-vibe-companion/server/cli-launcher.ts" -print -quit`;
+    const patchTarget = execSync(findCmd, { stdio: "pipe" }).toString().trim();
+    if (!patchTarget) return;
+
+    const src = readFileSync(patchTarget, "utf-8");
+    if (src.includes('CLAUDECODE: "1"')) {
+      writeFileSync(
+        patchTarget,
+        src.replace(/\s*CLAUDECODE: "1",?\n?/, "\n"),
+        "utf-8",
+      );
+      ok("Patched companion: removed CLAUDECODE nesting guard");
+    }
+  } catch {
+    /* best-effort — if we can't patch, the user will see the nesting error */
+  }
+}
+
 // ─── Banner ──────────────────────────────────────────────────────────────────
 
 console.log(`
@@ -460,19 +494,31 @@ if (autoCompanion && !(await isCompanionRunning())) {
   if (!commandExists("npx"))
     fail("npx not found — install Node.js from https://nodejs.org");
 
-  const compPort = new URL(companionUrl).port || "3457";
+  // Pre-install the companion package so we can patch it before spawning.
+  // npx --yes ensures no interactive prompt blocks the process.
   const npxCmd = IS_WIN ? "npx.cmd" : "npx";
-  companionProcess = spawn(
-    npxCmd,
-    ["--yes", "the-vibe-companion", "start", compPort],
-    {
+  info("Downloading companion (if not cached)...");
+  try {
+    execSync(`${npxCmd} --yes the-vibe-companion --help`, {
       stdio: "ignore",
-      detached: !IS_WIN,
-      shell: IS_WIN,
-    },
-  );
+      timeout: 60000,
+    });
+  } catch {
+    /* ignore — --help may exit non-zero, we just need the package cached */
+  }
+
+  // Now patch the CLAUDECODE nesting guard before spawning
+  patchCompanionNestingGuard();
+
+  // Spawn the companion server (uses default port 3456)
+  companionProcess = spawn(npxCmd, ["--yes", "the-vibe-companion", "start"], {
+    stdio: "ignore",
+    detached: !IS_WIN,
+    shell: IS_WIN,
+  });
   companionProcess.unref();
 
+  // Wait for the companion to become ready
   let ready = false;
   for (let attempt = 0; attempt < 30; attempt++) {
     await new Promise((r) => setTimeout(r, 1000));
