@@ -24,7 +24,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/guibros/companion-bridge"
+    "url": "https://github.com/moltymac/companion-bridge"
   },
   "engines": {
     "node": ">=18.0.0"
