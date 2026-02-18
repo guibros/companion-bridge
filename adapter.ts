@@ -30,16 +30,21 @@ import { randomUUID, createHash } from "node:crypto";
 // CONFIGURATION — all overridable via .env or environment variables
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const COMPANION_URL        = process.env.COMPANION_URL           ?? "http://localhost:3457";
-const ADAPTER_PORT         = parseInt(process.env.ADAPTER_PORT   ?? "8787");
-const SESSION_CWD          = process.env.SESSION_CWD             ?? `${process.env.HOME}/.openclaw/workspace`;
-const PERMISSION_MODE      = process.env.PERMISSION_MODE         ?? "default";
-const MODEL_NAME           = process.env.MODEL_NAME              ?? "claude-code-companion";
-const LOG_FORMAT           = (process.env.LOG_FORMAT ?? "pretty") as "pretty" | "json";
-const RESPONSE_TIMEOUT_MS  = parseInt(process.env.RESPONSE_TIMEOUT_MS   ?? "600000");   // 10 min
-const SESSION_IDLE_TIMEOUT = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS ?? "900000");  // 15 min
-const MAX_SESSIONS         = parseInt(process.env.MAX_SESSIONS           ?? "10");
-const TOOL_MODE            = (process.env.TOOL_MODE ?? "auto") as "auto" | "passthrough";
+const COMPANION_URL = process.env.COMPANION_URL ?? "http://localhost:3457";
+const ADAPTER_PORT = parseInt(process.env.ADAPTER_PORT ?? "8787");
+const SESSION_CWD =
+  process.env.SESSION_CWD ?? `${process.env.HOME}/.openclaw/workspace`;
+const PERMISSION_MODE = process.env.PERMISSION_MODE ?? "default";
+const MODEL_NAME = process.env.MODEL_NAME ?? "claude-code-companion";
+const LOG_FORMAT = (process.env.LOG_FORMAT ?? "pretty") as "pretty" | "json";
+const RESPONSE_TIMEOUT_MS = parseInt(
+  process.env.RESPONSE_TIMEOUT_MS ?? "1800000",
+); // 10 min
+const SESSION_IDLE_TIMEOUT = parseInt(
+  process.env.SESSION_IDLE_TIMEOUT_MS ?? "900000",
+); // 15 min
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS ?? "10");
+const TOOL_MODE = (process.env.TOOL_MODE ?? "auto") as "auto" | "passthrough";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STRUCTURED LOGGER
@@ -48,17 +53,36 @@ const TOOL_MODE            = (process.env.TOOL_MODE ?? "auto") as "auto" | "pass
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const log = {
-  _emit(level: string, tag: string, message: string, data?: Record<string, unknown>) {
+  _emit(
+    level: string,
+    tag: string,
+    message: string,
+    data?: Record<string, unknown>,
+  ) {
     if (LOG_FORMAT === "json") {
-      console.log(JSON.stringify({ ts: new Date().toISOString(), level, tag, message, ...data }));
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level,
+          tag,
+          message,
+          ...data,
+        }),
+      );
     } else {
       const extra = data ? " " + JSON.stringify(data) : "";
       console.log(`[${tag}] ${message}${extra}`);
     }
   },
-  info(t: string, m: string, d?: Record<string, unknown>)  { this._emit("info",  t, m, d); },
-  warn(t: string, m: string, d?: Record<string, unknown>)  { this._emit("warn",  t, m, d); },
-  error(t: string, m: string, d?: Record<string, unknown>) { this._emit("error", t, m, d); },
+  info(t: string, m: string, d?: Record<string, unknown>) {
+    this._emit("info", t, m, d);
+  },
+  warn(t: string, m: string, d?: Record<string, unknown>) {
+    this._emit("warn", t, m, d);
+  },
+  error(t: string, m: string, d?: Record<string, unknown>) {
+    this._emit("error", t, m, d);
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -76,17 +100,17 @@ const log = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 interface ToolPolicyRule {
-  tool: string;                   // Tool name or "*" for catch-all
+  tool: string; // Tool name or "*" for catch-all
   action: "allow" | "deny" | "passthrough";
-  inputContains?: string;         // Optional: only match if input has this substring
+  inputContains?: string; // Optional: only match if input has this substring
 }
 
 const DEFAULT_POLICY: ToolPolicyRule[] = [
-  { tool: "Read",       action: "allow" },
-  { tool: "Glob",       action: "allow" },
-  { tool: "Grep",       action: "allow" },
-  { tool: "WebSearch",  action: "allow" },
-  { tool: "Task",       action: "allow" },
+  { tool: "Read", action: "allow" },
+  { tool: "Glob", action: "allow" },
+  { tool: "Grep", action: "allow" },
+  { tool: "WebSearch", action: "allow" },
+  { tool: "Task", action: "allow" },
   // Everything else follows TOOL_MODE
   { tool: "*", action: TOOL_MODE === "passthrough" ? "passthrough" : "allow" },
 ];
@@ -98,7 +122,9 @@ function loadToolPolicy(): ToolPolicyRule[] {
       const parsed = JSON.parse(env);
       if (!Array.isArray(parsed)) throw new Error("Must be a JSON array");
       return parsed as ToolPolicyRule[];
-    } catch (e) { log.warn("policy", `Invalid TOOL_POLICY, using defaults: ${e}`); }
+    } catch (e) {
+      log.warn("policy", `Invalid TOOL_POLICY, using defaults: ${e}`);
+    }
   }
   return DEFAULT_POLICY;
 }
@@ -111,8 +137,13 @@ function evaluateToolPolicy(
   input: Record<string, unknown>,
 ): "allow" | "deny" | "passthrough" {
   for (const rule of toolPolicy) {
-    if (rule.tool !== "*" && rule.tool.toLowerCase() !== toolName.toLowerCase()) continue;
-    if (rule.inputContains && !JSON.stringify(input).includes(rule.inputContains)) continue;
+    if (rule.tool !== "*" && rule.tool.toLowerCase() !== toolName.toLowerCase())
+      continue;
+    if (
+      rule.inputContains &&
+      !JSON.stringify(input).includes(rule.inputContains)
+    )
+      continue;
     return rule.action;
   }
   return "allow"; // safe fallback
@@ -124,10 +155,20 @@ function evaluateToolPolicy(
 // e.g. Read {file_path: "/project/lore.md"} → "📖 Reading lore.md"
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function formatToolDetail(toolName: string, input: Record<string, unknown>): string {
+function formatToolDetail(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
   const icons: Record<string, string> = {
-    Read: "📖", Write: "✏️", Edit: "✏️", MultiEdit: "✏️",
-    Glob: "🔍", Grep: "🔎", Bash: "⚡", WebSearch: "🌐", Task: "📋",
+    Read: "📖",
+    Write: "✏️",
+    Edit: "✏️",
+    MultiEdit: "✏️",
+    Glob: "🔍",
+    Grep: "🔎",
+    Bash: "⚡",
+    WebSearch: "🌐",
+    Task: "📋",
   };
   const icon = icons[toolName] ?? "🔧";
 
@@ -135,8 +176,14 @@ function formatToolDetail(toolName: string, input: Record<string, unknown>): str
   const filePath = input.file_path ?? input.path ?? input.filename;
   if (filePath && typeof filePath === "string") {
     const base = filePath.split("/").pop() ?? filePath;
-    const verb = toolName === "Read" ? "Reading" : toolName === "Write" ? "Writing"
-               : toolName === "Edit" ? "Editing" : `${toolName}:`;
+    const verb =
+      toolName === "Read"
+        ? "Reading"
+        : toolName === "Write"
+          ? "Writing"
+          : toolName === "Edit"
+            ? "Editing"
+            : `${toolName}:`;
     return `${icon} ${verb} ${base}`;
   }
 
@@ -166,11 +213,22 @@ function formatToolDetail(toolName: string, input: Record<string, unknown>): str
 interface CompanionAssistantMsg {
   type: "assistant";
   message: {
-    id: string; model: string;
-    content: { type: string; text?: string; name?: string; input?: unknown; id?: string }[];
+    id: string;
+    model: string;
+    content: {
+      type: string;
+      text?: string;
+      name?: string;
+      input?: unknown;
+      id?: string;
+    }[];
     stop_reason: string | null;
-    usage: { input_tokens: number; output_tokens: number;
-             cache_creation_input_tokens: number; cache_read_input_tokens: number };
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_creation_input_tokens: number;
+      cache_read_input_tokens: number;
+    };
   };
   parent_tool_use_id: string | null;
 }
@@ -178,18 +236,28 @@ interface CompanionAssistantMsg {
 interface CompanionResultMsg {
   type: "result";
   data: {
-    is_error: boolean; result?: string; errors?: string[];
-    total_cost_usd: number; num_turns: number;
-    usage: { input_tokens: number; output_tokens: number;
-             cache_creation_input_tokens: number; cache_read_input_tokens: number };
+    is_error: boolean;
+    result?: string;
+    errors?: string[];
+    total_cost_usd: number;
+    num_turns: number;
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_creation_input_tokens: number;
+      cache_read_input_tokens: number;
+    };
   };
 }
 
 interface CompanionPermissionMsg {
   type: "permission_request";
   request: {
-    request_id: string; tool_name: string;
-    input: Record<string, unknown>; description?: string; tool_use_id: string;
+    request_id: string;
+    tool_name: string;
+    input: Record<string, unknown>;
+    description?: string;
+    tool_use_id: string;
   };
 }
 
@@ -209,8 +277,11 @@ interface CompanionSessionInitMsg {
 }
 
 type CompanionMsg =
-  | CompanionAssistantMsg | CompanionResultMsg | CompanionPermissionMsg
-  | CompanionStreamEventMsg | CompanionSessionInitMsg
+  | CompanionAssistantMsg
+  | CompanionResultMsg
+  | CompanionPermissionMsg
+  | CompanionStreamEventMsg
+  | CompanionSessionInitMsg
   | { type: string; [k: string]: unknown };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -218,17 +289,23 @@ type CompanionMsg =
 // ═══════════════════════════════════════════════════════════════════════════════
 
 interface OAIChatMessage {
-  role: string; content: string | null;
-  tool_calls?: OAIToolCall[]; tool_call_id?: string;
+  role: string;
+  content: string | null;
+  tool_calls?: OAIToolCall[];
+  tool_call_id?: string;
 }
 
 interface OAIChatRequest {
-  model?: string; messages: OAIChatMessage[];
-  stream?: boolean; max_tokens?: number; tools?: unknown[];
+  model?: string;
+  messages: OAIChatMessage[];
+  stream?: boolean;
+  max_tokens?: number;
+  tools?: unknown[];
 }
 
 interface OAIToolCall {
-  id: string; type: "function";
+  id: string;
+  type: "function";
   function: { name: string; arguments: string };
 }
 
@@ -248,7 +325,8 @@ function validateChatRequest(body: unknown): string | null {
     if (!["system", "user", "assistant", "tool"].includes(m.role))
       return `messages[${i}].role must be system|user|assistant|tool`;
   }
-  if (r.stream !== undefined && typeof r.stream !== "boolean") return "stream must be boolean";
+  if (r.stream !== undefined && typeof r.stream !== "boolean")
+    return "stream must be boolean";
   return null;
 }
 
@@ -257,30 +335,37 @@ function validateChatRequest(body: unknown): string | null {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type ProgressEvent =
-  | { kind: "tool_start";  tool: string; detail: string }
+  | { kind: "tool_start"; tool: string; detail: string }
   | { kind: "tool_result"; tool: string; success: boolean }
-  | { kind: "text_delta";  text: string }
-  | { kind: "thinking";    status: string }
-  | { kind: "turn";        turnNumber: number };
+  | { kind: "text_delta"; text: string }
+  | { kind: "thinking"; status: string }
+  | { kind: "turn"; turnNumber: number };
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SESSION — state machine for a single Companion connection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-type SessionState = "connecting" | "ready" | "busy" | "waiting_tool_decision" | "dead";
+type SessionState =
+  | "connecting"
+  | "ready"
+  | "busy"
+  | "waiting_tool_decision"
+  | "dead";
 
 interface PendingPermission {
-  requestId: string; toolName: string;
-  input: Record<string, unknown>; description?: string;
+  requestId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  description?: string;
   toolCallId: string;
 }
 
 interface ManagedSession {
-  key: string;                          // Pool key (derived from request)
-  companionSessionId: string;           // Companion-side session ID
-  ws: WebSocket | null;                 // Persistent WS to Companion
+  key: string; // Pool key (derived from request)
+  companionSessionId: string; // Companion-side session ID
+  ws: WebSocket | null; // Persistent WS to Companion
   state: SessionState;
-  model: string;                        // Reported by Claude Code
+  model: string; // Reported by Claude Code
   lastActivityAt: number;
   // ── Per-request accumulators (reset on each sendPrompt) ──
   currentText: string;
@@ -298,9 +383,12 @@ interface ManagedSession {
 }
 
 interface SessionResponse {
-  text: string; model: string;
-  inputTokens: number; outputTokens: number;
-  cost: number; turns: number;
+  text: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  turns: number;
   pendingToolCalls: PendingPermission[];
 }
 
@@ -327,14 +415,22 @@ class SessionPool {
     // Spin up a new Companion session + Claude Code CLI
     const cid = await this.createCompanionSession();
     s = {
-      key, companionSessionId: cid, ws: null,
-      state: "connecting", model: model ?? MODEL_NAME,
+      key,
+      companionSessionId: cid,
+      ws: null,
+      state: "connecting",
+      model: model ?? MODEL_NAME,
       lastActivityAt: Date.now(),
-      currentText: "", currentUsage: { input: 0, output: 0 },
-      currentCost: 0, currentTurns: 0,
-      pendingResolve: null, pendingReject: null,
+      currentText: "",
+      currentUsage: { input: 0, output: 0 },
+      currentCost: 0,
+      currentTurns: 0,
+      pendingResolve: null,
+      pendingReject: null,
       pendingPermissions: new Map(),
-      timeoutHandle: null, idleHandle: null, onProgress: null,
+      timeoutHandle: null,
+      idleHandle: null,
+      onProgress: null,
     };
     this.sessions.set(key, s);
     await this.connectWs(s);
@@ -356,7 +452,9 @@ class SessionPool {
 
       // Safety net: don't hang forever
       s.timeoutHandle = setTimeout(() => {
-        s.pendingReject?.(new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`));
+        s.pendingReject?.(
+          new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`),
+        );
         s.pendingResolve = null;
         s.pendingReject = null;
         s.state = "ready";
@@ -373,19 +471,43 @@ class SessionPool {
   }
 
   /** Forward a tool approval/denial from the client back to Companion (passthrough mode). */
-  resolveToolPermission(s: ManagedSession, toolCallId: string, approved: boolean, message?: string): void {
+  resolveToolPermission(
+    s: ManagedSession,
+    toolCallId: string,
+    approved: boolean,
+    message?: string,
+  ): void {
     const p = s.pendingPermissions.get(toolCallId);
     if (!p || !s.ws) return;
     s.pendingPermissions.delete(toolCallId);
 
     const resp = approved
-      ? { type: "control_response", response: { subtype: "success", request_id: p.requestId,
-          response: { behavior: "allow", updatedInput: p.input } } }
-      : { type: "control_response", response: { subtype: "success", request_id: p.requestId,
-          response: { behavior: "deny", message: message ?? "Denied by client" } } };
+      ? {
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: p.requestId,
+            response: { behavior: "allow", updatedInput: p.input },
+          },
+        }
+      : {
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: p.requestId,
+            response: {
+              behavior: "deny",
+              message: message ?? "Denied by client",
+            },
+          },
+        };
 
     s.ws.send(JSON.stringify(resp));
-    log.info("policy", `Tool ${p.toolName} ${approved ? "approved" : "denied"}`, { session: s.key });
+    log.info(
+      "policy",
+      `Tool ${p.toolName} ${approved ? "approved" : "denied"}`,
+      { session: s.key },
+    );
     s.state = "busy"; // Back to waiting for Claude Code to continue
   }
 
@@ -400,14 +522,24 @@ class SessionPool {
     s.state = "dead";
     this.sessions.delete(key);
     // Best-effort kill on Companion side
-    fetch(`${COMPANION_URL}/api/sessions/${s.companionSessionId}/kill`, { method: "POST" }).catch(() => {});
+    fetch(`${COMPANION_URL}/api/sessions/${s.companionSessionId}/kill`, {
+      method: "POST",
+    }).catch(() => {});
     log.info("pool", `Destroyed session ${key}`);
   }
 
   /** List sessions for the /health endpoint. */
-  listSessions(): { key: string; state: SessionState; model: string; age: number }[] {
+  listSessions(): {
+    key: string;
+    state: SessionState;
+    model: string;
+    age: number;
+  }[] {
     return Array.from(this.sessions.values()).map((s) => ({
-      key: s.key, state: s.state, model: s.model, age: Date.now() - s.lastActivityAt,
+      key: s.key,
+      state: s.state,
+      model: s.model,
+      age: Date.now() - s.lastActivityAt,
     }));
   }
 
@@ -418,10 +550,15 @@ class SessionPool {
     const res = await fetch(`${COMPANION_URL}/api/sessions/create`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ permissionMode: PERMISSION_MODE, cwd: SESSION_CWD }),
+      body: JSON.stringify({
+        permissionMode: PERMISSION_MODE,
+        cwd: SESSION_CWD,
+      }),
     });
     if (!res.ok) {
-      throw new Error(`Companion session creation failed: ${res.status} ${await res.text()}`);
+      throw new Error(
+        `Companion session creation failed: ${res.status} ${await res.text()}`,
+      );
     }
     const data = (await res.json()) as { sessionId: string };
     log.info("pool", `Created Companion session: ${data.sessionId}`);
@@ -431,8 +568,9 @@ class SessionPool {
   /** Open a persistent WebSocket to the Companion browser endpoint. */
   private connectWs(session: ManagedSession): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wsUrl = COMPANION_URL.replace(/^http/, "ws") +
-                    `/ws/browser/${session.companionSessionId}`;
+      const wsUrl =
+        COMPANION_URL.replace(/^http/, "ws") +
+        `/ws/browser/${session.companionSessionId}`;
       const ws = new WebSocket(wsUrl);
       session.ws = ws;
 
@@ -441,21 +579,33 @@ class SessionPool {
       ws.onmessage = (event) => {
         let msg: CompanionMsg;
         try {
-          msg = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
-        } catch { return; } // skip malformed frames
+          msg = JSON.parse(
+            typeof event.data === "string" ? event.data : event.data.toString(),
+          );
+        } catch {
+          return;
+        } // skip malformed frames
         this.handleMessage(session, msg, resolve);
       };
 
       ws.onerror = (err) => {
-        log.error("pool", `WS error for ${session.key}`, { error: String(err) });
-        if (session.state === "connecting") reject(new Error("WebSocket connection failed"));
+        log.error("pool", `WS error for ${session.key}`, {
+          error: String(err),
+        });
+        if (session.state === "connecting")
+          reject(new Error("WebSocket connection failed"));
         session.state = "dead";
       };
 
       ws.onclose = () => {
         log.info("pool", `WS closed for ${session.key}`);
-        if (session.state === "busy" || session.state === "waiting_tool_decision") {
-          session.pendingReject?.(new Error("WebSocket closed while waiting for response"));
+        if (
+          session.state === "busy" ||
+          session.state === "waiting_tool_decision"
+        ) {
+          session.pendingReject?.(
+            new Error("WebSocket closed while waiting for response"),
+          );
           session.pendingResolve = null;
           session.pendingReject = null;
         }
@@ -476,7 +626,6 @@ class SessionPool {
     connectResolve: () => void,
   ): void {
     switch (msg.type) {
-
       // ── Session init: cache loaded, CLI may still be booting ───────
       case "session_init": {
         const m = msg as CompanionSessionInitMsg;
@@ -524,30 +673,36 @@ class SessionPool {
       // ── Tool permission: evaluate policy → allow/deny/passthrough ──
       case "permission_request": {
         const m = msg as CompanionPermissionMsg;
-        const decision = evaluateToolPolicy(m.request.tool_name, m.request.input);
+        const decision = evaluateToolPolicy(
+          m.request.tool_name,
+          m.request.input,
+        );
 
         if (decision === "allow") {
           log.info("policy", `AUTO-ALLOW: ${m.request.tool_name}`);
           s.onProgress?.({
-            kind: "tool_start", tool: m.request.tool_name,
+            kind: "tool_start",
+            tool: m.request.tool_name,
             detail: formatToolDetail(m.request.tool_name, m.request.input),
           });
-          s.ws?.send(JSON.stringify({
-            type: "permission_response",
-            request_id: m.request.request_id,
-            behavior: "allow",
-            updated_input: m.request.input,
-          }));
-
+          s.ws?.send(
+            JSON.stringify({
+              type: "permission_response",
+              request_id: m.request.request_id,
+              behavior: "allow",
+              updated_input: m.request.input,
+            }),
+          );
         } else if (decision === "deny") {
           log.info("policy", `AUTO-DENY: ${m.request.tool_name}`);
-          s.ws?.send(JSON.stringify({
-            type: "permission_response",
-            request_id: m.request.request_id,
-            behavior: "deny",
-            message: "Denied by adapter policy",
-          }));
-
+          s.ws?.send(
+            JSON.stringify({
+              type: "permission_response",
+              request_id: m.request.request_id,
+              behavior: "deny",
+              message: "Denied by adapter policy",
+            }),
+          );
         } else {
           // PASSTHROUGH: park the request and return tool_calls to the client
           log.info("policy", `PASSTHROUGH: ${m.request.tool_name}`);
@@ -565,9 +720,12 @@ class SessionPool {
 
           // Resolve current HTTP request with the pending tool calls
           s.pendingResolve?.({
-            text: s.currentText, model: s.model,
-            inputTokens: s.currentUsage.input, outputTokens: s.currentUsage.output,
-            cost: s.currentCost, turns: s.currentTurns,
+            text: s.currentText,
+            model: s.model,
+            inputTokens: s.currentUsage.input,
+            outputTokens: s.currentUsage.output,
+            cost: s.currentCost,
+            turns: s.currentTurns,
             pendingToolCalls: Array.from(s.pendingPermissions.values()),
           });
           s.pendingResolve = null;
@@ -602,9 +760,13 @@ class SessionPool {
         this.resetIdleTimer(s);
 
         s.pendingResolve?.({
-          text: s.currentText, model: s.model,
-          inputTokens: s.currentUsage.input, outputTokens: s.currentUsage.output,
-          cost: s.currentCost, turns: s.currentTurns, pendingToolCalls: [],
+          text: s.currentText,
+          model: s.model,
+          inputTokens: s.currentUsage.input,
+          outputTokens: s.currentUsage.output,
+          cost: s.currentCost,
+          turns: s.currentTurns,
+          pendingToolCalls: [],
         });
         s.pendingResolve = null;
         s.pendingReject = null;
@@ -644,7 +806,11 @@ class SessionPool {
         }
 
         // Thinking delta → log activity (don't expose internal reasoning)
-        if (evt.type === "content_block_delta" && evt.delta?.type === "thinking_delta" && evt.delta.text) {
+        if (
+          evt.type === "content_block_delta" &&
+          evt.delta?.type === "thinking_delta" &&
+          evt.delta.text
+        ) {
           log.info("stream", `🧠 (thinking ${evt.delta.text.length} chars)`);
         }
 
@@ -661,7 +827,11 @@ class SessionPool {
 
       // ── Tool result: tool execution completed ──────────────────────
       case "tool_result": {
-        const m = msg as { type: string; tool_name?: string; is_error?: boolean };
+        const m = msg as {
+          type: string;
+          tool_name?: string;
+          is_error?: boolean;
+        };
         const name = m.tool_name ?? "unknown";
         const ok = !m.is_error;
         log.info("stream", `${ok ? "✅" : "❌"} Tool result: ${name}`);
@@ -706,12 +876,15 @@ class SessionPool {
     while (this.sessions.size >= MAX_SESSIONS) {
       let oldest: ManagedSession | null = null;
       for (const s of this.sessions.values()) {
-        if ((s.state === "ready" || s.state === "dead") &&
-            (!oldest || s.lastActivityAt < oldest.lastActivityAt)) {
+        if (
+          (s.state === "ready" || s.state === "dead") &&
+          (!oldest || s.lastActivityAt < oldest.lastActivityAt)
+        ) {
           oldest = s;
         }
       }
-      if (oldest) this.destroySession(oldest.key); else break;
+      if (oldest) this.destroySession(oldest.key);
+      else break;
     }
   }
 }
@@ -739,7 +912,10 @@ function deriveSessionKey(req: Request, body: OAIChatRequest): string {
 
   const sys = body.messages.find((m) => m.role === "system");
   if (sys?.content) {
-    const hash = createHash("sha256").update(sys.content).digest("hex").slice(0, 16);
+    const hash = createHash("sha256")
+      .update(sys.content)
+      .digest("hex")
+      .slice(0, 16);
     return `sys:${hash}`;
   }
 
@@ -748,7 +924,15 @@ function deriveSessionKey(req: Request, body: OAIChatRequest): string {
 
 /** Words that count as "approved" in tool result messages from the client. */
 const APPROVAL_WORDS = new Set([
-  "approved", "allow", "allowed", "yes", "true", "ok", "accept", "permit", "granted",
+  "approved",
+  "allow",
+  "allowed",
+  "yes",
+  "true",
+  "ok",
+  "accept",
+  "permit",
+  "granted",
 ]);
 
 /** Extract tool approval/denial results from the message history (passthrough mode). */
@@ -759,8 +943,14 @@ function extractToolResults(
     .filter((m) => m.role === "tool" && m.tool_call_id)
     .map((m) => {
       const content = (m.content ?? "").trim();
-      const approved = APPROVAL_WORDS.has(content.toLowerCase().replace(/[^a-z]/g, ""));
-      return { toolCallId: m.tool_call_id!, approved, message: content || "No reason" };
+      const approved = APPROVAL_WORDS.has(
+        content.toLowerCase().replace(/[^a-z]/g, ""),
+      );
+      return {
+        toolCallId: m.tool_call_id!,
+        approved,
+        message: content || "No reason",
+      };
     });
 }
 
@@ -793,19 +983,30 @@ function createLiveSSE(
       // Safe write — won't crash if the client disconnected
       const send = (data: string) => {
         if (closed) return;
-        try { controller.enqueue(encoder.encode(data)); }
-        catch { closed = true; }
+        try {
+          controller.enqueue(encoder.encode(data));
+        } catch {
+          closed = true;
+        }
       };
 
       // SSE chunk helper — tracks whether we've sent the role yet
       let sentRole = false;
       const sendChunk = (content: string) => {
         const delta: Record<string, unknown> = { content };
-        if (!sentRole) { delta.role = "assistant"; sentRole = true; }
-        send(`data: ${JSON.stringify({
-          id, object: "chat.completion.chunk", created, model: session.model,
-          choices: [{ index: 0, delta, finish_reason: null }],
-        })}\n\n`);
+        if (!sentRole) {
+          delta.role = "assistant";
+          sentRole = true;
+        }
+        send(
+          `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: session.model,
+            choices: [{ index: 0, delta, finish_reason: null }],
+          })}\n\n`,
+        );
       };
 
       // Heartbeat: SSE comment every 5s keeps the connection alive
@@ -842,24 +1043,29 @@ function createLiveSSE(
 
         log.info("adapter", `Response: ${response.text.length} chars`, {
           tokens: `${response.inputTokens}/${response.outputTokens}`,
-          cost: `$${response.cost.toFixed(4)}`, turns: response.turns,
+          cost: `$${response.cost.toFixed(4)}`,
+          turns: response.turns,
         });
 
         // If nothing was streamed yet, send the complete text now
         if (!streamed && response.text) sendChunk(response.text);
 
         // Finish signal with usage stats
-        send(`data: ${JSON.stringify({
-          id, object: "chat.completion.chunk", created, model: session.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          usage: {
-            prompt_tokens: response.inputTokens,
-            completion_tokens: response.outputTokens,
-            total_tokens: response.inputTokens + response.outputTokens,
-          },
-        })}\n\n`);
+        send(
+          `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: session.model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: {
+              prompt_tokens: response.inputTokens,
+              completion_tokens: response.outputTokens,
+              total_tokens: response.inputTokens + response.outputTokens,
+            },
+          })}\n\n`,
+        );
         send(`data: [DONE]\n\n`);
-
       } catch (err) {
         clearInterval(heartbeat);
         session.onProgress = null;
@@ -878,7 +1084,7 @@ function createLiveSSE(
       ...headers,
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
     },
   });
 }
@@ -906,37 +1112,61 @@ function formatJsonResponse(
     const toolCalls = r.pendingToolCalls.map((p) => ({
       id: p.toolCallId,
       type: "function" as const,
-      function: { name: `cc_${p.toolName.toLowerCase()}`, arguments: JSON.stringify(p.input) },
+      function: {
+        name: `cc_${p.toolName.toLowerCase()}`,
+        arguments: JSON.stringify(p.input),
+      },
     }));
     log.info("adapter", `Returning ${toolCalls.length} tool_calls`, {
       tools: toolCalls.map((t) => t.function.name),
     });
-    return Response.json({
-      id, object: "chat.completion", created, model: s.model,
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: r.text || null, tool_calls: toolCalls },
-        finish_reason: "tool_calls",
-      }],
-      usage,
-    }, { headers });
+    return Response.json(
+      {
+        id,
+        object: "chat.completion",
+        created,
+        model: s.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: r.text || null,
+              tool_calls: toolCalls,
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage,
+      },
+      { headers },
+    );
   }
 
   // Normal text response
   log.info("adapter", `Response: ${r.text.length} chars`, {
     tokens: `${r.inputTokens}/${r.outputTokens}`,
-    cost: `$${r.cost.toFixed(4)}`, turns: r.turns,
+    cost: `$${r.cost.toFixed(4)}`,
+    turns: r.turns,
   });
 
-  return Response.json({
-    id, object: "chat.completion", created, model: s.model,
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: r.text },
-      finish_reason: "stop",
-    }],
-    usage,
-  }, { headers });
+  return Response.json(
+    {
+      id,
+      object: "chat.completion",
+      created,
+      model: s.model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: r.text },
+          finish_reason: "stop",
+        },
+      ],
+      usage,
+    },
+    { headers },
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -946,7 +1176,8 @@ function formatJsonResponse(
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-Key, X-Request-Id",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Session-Key, X-Request-Id",
 };
 
 Bun.serve({
@@ -962,23 +1193,37 @@ Bun.serve({
 
     // ── Health / monitoring ─────────────────────────────────────────
     if (url.pathname === "/health") {
-      return Response.json({
-        status: "ok", version: "3.0.0",
-        companion: COMPANION_URL, cwd: SESSION_CWD,
-        toolMode: TOOL_MODE, permissionMode: PERMISSION_MODE,
-        model: MODEL_NAME, sessions: pool.listSessions(),
-      }, { headers: CORS });
+      return Response.json(
+        {
+          status: "ok",
+          version: "3.0.0",
+          companion: COMPANION_URL,
+          cwd: SESSION_CWD,
+          toolMode: TOOL_MODE,
+          permissionMode: PERMISSION_MODE,
+          model: MODEL_NAME,
+          sessions: pool.listSessions(),
+        },
+        { headers: CORS },
+      );
     }
 
     // ── Model listing (OpenAI compat) ───────────────────────────────
     if (url.pathname === "/v1/models" && req.method === "GET") {
-      return Response.json({
-        object: "list",
-        data: [{
-          id: MODEL_NAME, object: "model",
-          created: Math.floor(Date.now() / 1000), owned_by: "companion-bridge",
-        }],
-      }, { headers: CORS });
+      return Response.json(
+        {
+          object: "list",
+          data: [
+            {
+              id: MODEL_NAME,
+              object: "model",
+              created: Math.floor(Date.now() / 1000),
+              owned_by: "companion-bridge",
+            },
+          ],
+        },
+        { headers: CORS },
+      );
     }
 
     // ── Session management ──────────────────────────────────────────
@@ -990,10 +1235,11 @@ Bun.serve({
 
     // ── Chat completions — the main endpoint ────────────────────────
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-
       // Parse and validate
       let rawBody: unknown;
-      try { rawBody = await req.json(); } catch {
+      try {
+        rawBody = await req.json();
+      } catch {
         return Response.json(
           { error: { message: "Invalid JSON", type: "invalid_request_error" } },
           { status: 400, headers: CORS },
@@ -1003,7 +1249,9 @@ Bun.serve({
       const validationError = validateChatRequest(rawBody);
       if (validationError) {
         return Response.json(
-          { error: { message: validationError, type: "invalid_request_error" } },
+          {
+            error: { message: validationError, type: "invalid_request_error" },
+          },
           { status: 400, headers: CORS },
         );
       }
@@ -1018,7 +1266,12 @@ Bun.serve({
         session = await pool.getSession(sessionKey, body.model);
       } catch (err) {
         return Response.json(
-          { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
+          {
+            error: {
+              message: err instanceof Error ? err.message : String(err),
+              type: "server_error",
+            },
+          },
           { status: 502, headers: CORS },
         );
       }
@@ -1027,43 +1280,70 @@ Bun.serve({
       const toolResults = extractToolResults(body.messages);
       if (toolResults.length > 0 && session.state === "waiting_tool_decision") {
         for (const r of toolResults) {
-          pool.resolveToolPermission(session, r.toolCallId, r.approved, r.message);
+          pool.resolveToolPermission(
+            session,
+            r.toolCallId,
+            r.approved,
+            r.message,
+          );
         }
 
         // Wait for Claude Code to continue after the tool decisions
-        const waitForContinuation = () => new Promise<SessionResponse>((resolve, reject) => {
-          session.currentText = "";
-          session.pendingResolve = resolve;
-          session.pendingReject = reject;
-          session.state = "busy";
-          session.timeoutHandle = setTimeout(() => {
-            reject(new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`));
-            session.state = "ready";
-          }, RESPONSE_TIMEOUT_MS);
-        });
+        const waitForContinuation = () =>
+          new Promise<SessionResponse>((resolve, reject) => {
+            session.currentText = "";
+            session.pendingResolve = resolve;
+            session.pendingReject = reject;
+            session.state = "busy";
+            session.timeoutHandle = setTimeout(() => {
+              reject(
+                new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`),
+              );
+              session.state = "ready";
+            }, RESPONSE_TIMEOUT_MS);
+          });
 
-        if (wantStream) return createLiveSSE(session, waitForContinuation, CORS);
-        try { return formatJsonResponse(await waitForContinuation(), session, CORS); }
-        catch (err) {
+        if (wantStream)
+          return createLiveSSE(session, waitForContinuation, CORS);
+        try {
+          return formatJsonResponse(await waitForContinuation(), session, CORS);
+        } catch (err) {
           return Response.json(
-            { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
+            {
+              error: {
+                message: err instanceof Error ? err.message : String(err),
+                type: "server_error",
+              },
+            },
             { status: 500, headers: CORS },
           );
         }
       }
 
       // ── Extract the user's prompt ──────────────────────────────
-      const prompt = body.messages.filter((m) => m.role === "user").at(-1)?.content;
+      const prompt = body.messages
+        .filter((m) => m.role === "user")
+        .at(-1)?.content;
       if (!prompt) {
         return Response.json(
-          { error: { message: "No user message found", type: "invalid_request_error" } },
+          {
+            error: {
+              message: "No user message found",
+              type: "invalid_request_error",
+            },
+          },
           { status: 400, headers: CORS },
         );
       }
 
       // ── Session busy → wait with live progress ─────────────────
-      if (session.state === "busy" || session.state === "waiting_tool_decision") {
-        log.info("adapter", "Session busy, waiting with live progress...", { session: sessionKey });
+      if (
+        session.state === "busy" ||
+        session.state === "waiting_tool_decision"
+      ) {
+        log.info("adapter", "Session busy, waiting with live progress...", {
+          session: sessionKey,
+        });
 
         if (wantStream) {
           return createLiveSSE(
@@ -1071,7 +1351,8 @@ Bun.serve({
             async () => {
               // Poll until the previous task finishes
               while (
-                (session.state === "busy" || session.state === "waiting_tool_decision") &&
+                (session.state === "busy" ||
+                  session.state === "waiting_tool_decision") &&
                 Date.now() - session.lastActivityAt < RESPONSE_TIMEOUT_MS
               ) {
                 await new Promise((r) => setTimeout(r, 500));
@@ -1082,27 +1363,39 @@ Bun.serve({
                 pool.destroySession(sessionKey);
                 session = await pool.getSession(sessionKey, body.model);
               } else if (session.state !== "ready") {
-                throw new Error("Session timed out while waiting for previous task");
+                throw new Error(
+                  "Session timed out while waiting for previous task",
+                );
               }
 
               return pool.sendPrompt(session, prompt);
             },
             CORS,
-            (sendStatus) => sendStatus("⏳ _Previous task still running, waiting..._\n\n"),
+            (sendStatus) =>
+              sendStatus("⏳ _Previous task still running, waiting..._\n\n"),
           );
         }
 
         // Non-streaming busy wait (fallback)
         const waitStart = Date.now();
         while (
-          (session.state === "busy" || session.state === "waiting_tool_decision") &&
+          (session.state === "busy" ||
+            session.state === "waiting_tool_decision") &&
           Date.now() - waitStart < RESPONSE_TIMEOUT_MS
         ) {
           await new Promise((r) => setTimeout(r, 500));
         }
-        if (session.state === "busy" || session.state === "waiting_tool_decision") {
+        if (
+          session.state === "busy" ||
+          session.state === "waiting_tool_decision"
+        ) {
           return Response.json(
-            { error: { message: "Session still busy after timeout", type: "server_error" } },
+            {
+              error: {
+                message: "Session still busy after timeout",
+                type: "server_error",
+              },
+            },
             { status: 429, headers: CORS },
           );
         }
@@ -1111,10 +1404,16 @@ Bun.serve({
       // ── Dead session → recreate ────────────────────────────────
       if (session.state === "dead") {
         pool.destroySession(sessionKey);
-        try { session = await pool.getSession(sessionKey, body.model); }
-        catch (err) {
+        try {
+          session = await pool.getSession(sessionKey, body.model);
+        } catch (err) {
           return Response.json(
-            { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
+            {
+              error: {
+                message: err instanceof Error ? err.message : String(err),
+                type: "server_error",
+              },
+            },
             { status: 502, headers: CORS },
           );
         }
@@ -1122,11 +1421,19 @@ Bun.serve({
 
       // ── Send the prompt ────────────────────────────────────────
       if (wantStream) {
-        return createLiveSSE(session, () => pool.sendPrompt(session, prompt), CORS);
+        return createLiveSSE(
+          session,
+          () => pool.sendPrompt(session, prompt),
+          CORS,
+        );
       }
 
       try {
-        return formatJsonResponse(await pool.sendPrompt(session, prompt), session, CORS);
+        return formatJsonResponse(
+          await pool.sendPrompt(session, prompt),
+          session,
+          CORS,
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.error("adapter", msg);
@@ -1165,8 +1472,8 @@ console.log(`
 ║  Log format:  ${LOG_FORMAT.padEnd(43)}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Tool policy:                                               ║
-${toolPolicy.map((r) =>
-  `║    ${r.tool.padEnd(20)} → ${r.action.padEnd(33)}║`
-).join("\n")}
+${toolPolicy
+  .map((r) => `║    ${r.tool.padEnd(20)} → ${r.action.padEnd(33)}║`)
+  .join("\n")}
 ╚══════════════════════════════════════════════════════════════╝
 `);
