@@ -901,15 +901,23 @@ const pool = new SessionPool();
 
 /**
  * Derive a deterministic session key from the request.
- * Priority: X-Session-Key header > X-Request-Id > SHA-256 of system message > "default"
+ * Priority: X-Session-Key header > SHA-256 of system message > "default"
+ *
+ * IMPORTANT: x-request-id is deliberately NOT used here. It's a per-request
+ * correlation ID (fresh UUID on every HTTP call), so using it as a session
+ * key would create a new Companion/CLI session on every single turn —
+ * destroying conversation continuity. The CLI session must persist across
+ * turns so Claude Code can accumulate conversation history internally.
+ *
+ * x-request-id is still logged for tracing (see pool.sendPrompt).
  */
 function deriveSessionKey(req: Request, body: OAIChatRequest): string {
+  // ① Explicit session key — client controls session reuse directly
   const hdr = req.headers.get("x-session-key");
   if (hdr) return `key:${hdr}`;
 
-  const rid = req.headers.get("x-request-id");
-  if (rid) return `req:${rid}`;
-
+  // ② System prompt hash — stable per agent config, gives natural
+  //    session affinity: same agent = same session = conversation continuity
   const sys = body.messages.find((m) => m.role === "system");
   if (sys?.content) {
     const hash = createHash("sha256")
@@ -919,6 +927,7 @@ function deriveSessionKey(req: Request, body: OAIChatRequest): string {
     return `sys:${hash}`;
   }
 
+  // ③ Fallback — single shared session (fine for single-agent setups)
   return "default";
 }
 
@@ -1259,6 +1268,13 @@ Bun.serve({
       const body = rawBody as OAIChatRequest;
       const sessionKey = deriveSessionKey(req, body);
       const wantStream = body.stream ?? false;
+
+      // Trace log: request-id is still useful for debugging, just not for session keying
+      const requestId = req.headers.get("x-request-id");
+      log.info("adapter", `Request → session=${sessionKey}`, {
+        requestId: requestId ?? "none",
+        stream: wantStream,
+      });
 
       // Acquire session from pool
       let session: ManagedSession;
