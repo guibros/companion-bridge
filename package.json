@@ -1,0 +1,32 @@
+{
+  "name": "companion-bridge",
+  "version": "3.0.0",
+  "description": "OpenAI-compatible adapter for Claude Code CLI. One command: npx companion-bridge",
+  "type": "module",
+  "bin": {
+    "companion-bridge": "bin/companion-bridge.mjs"
+  },
+  "scripts": {
+    "start": "bun run adapter.ts",
+    "dev": "bun run --watch adapter.ts"
+  },
+  "files": [
+    "adapter.ts",
+    "bin/companion-bridge.mjs",
+    ".env.example",
+    "README.md"
+  ],
+  "keywords": [
+    "claude-code", "openai", "adapter", "companion",
+    "openclaw", "bridge", "claude", "anthropic", "llm"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/guibros/companion-bridge"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
