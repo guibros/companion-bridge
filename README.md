@@ -116,7 +116,7 @@ companion-bridge
 bunx companion-bridge
 
 # From source
-git clone <repo> && cd companion-bridge && bun run start
+git clone https://github.com/guibros/companion-bridge.git && cd companion-bridge && bun run start
 ```
 
 ## Features
