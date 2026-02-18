@@ -52,9 +52,12 @@ const c = {
 };
 
 const info = (msg) => console.log(`${c.blue("ℹ")}  ${msg}`);
-const ok   = (msg) => console.log(`${c.green("✅")} ${msg}`);
+const ok = (msg) => console.log(`${c.green("✅")} ${msg}`);
 const warn = (msg) => console.log(`${c.yellow("⚠")}  ${msg}`);
-const fail = (msg) => { console.error(`${c.red("❌")} ${msg}`); process.exit(1); };
+const fail = (msg) => {
+  console.error(`${c.red("❌")} ${msg}`);
+  process.exit(1);
+};
 
 // ─── Parse CLI args ──────────────────────────────────────────────────────────
 
@@ -114,26 +117,40 @@ let i = 0;
 while (i < args.length) {
   const arg = args[i];
   switch (arg) {
-    case "--help": case "-h":
-      showHelp(); break;
+    case "--help":
+    case "-h":
+      showHelp();
+      break;
     case "--health":
-      await healthCheck(adapterPort); process.exit(0);
+      await healthCheck(adapterPort);
+      process.exit(0);
     case "--stop":
-      await stopSessions(adapterPort); process.exit(0);
+      await stopSessions(adapterPort);
+      process.exit(0);
     case "--port":
-      adapterPort = args[++i]; env.ADAPTER_PORT = adapterPort; break;
+      adapterPort = args[++i];
+      env.ADAPTER_PORT = adapterPort;
+      break;
     case "--companion":
-      companionUrl = args[++i]; env.COMPANION_URL = companionUrl; break;
+      companionUrl = args[++i];
+      env.COMPANION_URL = companionUrl;
+      break;
     case "--no-companion":
-      autoCompanion = false; break;
+      autoCompanion = false;
+      break;
     case "--no-openclaw":
-      skipOpenclawSetup = true; break;
+      skipOpenclawSetup = true;
+      break;
     case "--passthrough":
-      env.TOOL_MODE = "passthrough"; break;
+      env.TOOL_MODE = "passthrough";
+      break;
     case "--json-logs":
-      env.LOG_FORMAT = "json"; break;
+      env.LOG_FORMAT = "json";
+      break;
     case "--model":
-      modelName = args[++i]; env.MODEL_NAME = modelName; break;
+      modelName = args[++i];
+      env.MODEL_NAME = modelName;
+      break;
     default:
       if (!arg.startsWith("-")) {
         env.SESSION_CWD = resolve(arg);
@@ -151,7 +168,9 @@ async function healthCheck(port) {
     const res = await fetch(`http://localhost:${port}/health`);
     const data = await res.json();
     console.log(JSON.stringify(data, null, 2));
-  } catch { fail(`Adapter not running on :${port}`); }
+  } catch {
+    fail(`Adapter not running on :${port}`);
+  }
 }
 
 async function stopSessions(port) {
@@ -159,11 +178,15 @@ async function stopSessions(port) {
     const res = await fetch(`http://localhost:${port}/health`);
     const data = await res.json();
     for (const s of data.sessions || []) {
-      await fetch(`http://localhost:${port}/sessions/${s.key}`, { method: "DELETE" });
+      await fetch(`http://localhost:${port}/sessions/${s.key}`, {
+        method: "DELETE",
+      });
       ok(`Killed session: ${s.key}`);
     }
     if (!data.sessions?.length) info("No active sessions");
-  } catch { fail(`Adapter not running on :${port}`); }
+  } catch {
+    fail(`Adapter not running on :${port}`);
+  }
 }
 
 // ─── OpenClaw Auto-Configuration ─────────────────────────────────────────────
@@ -251,7 +274,11 @@ function configureOpenclaw() {
     config.meta.lastTouchedAt = new Date().toISOString();
 
     try {
-      writeFileSync(OPENCLAW_JSON, JSON.stringify(config, null, 2) + "\n", "utf-8");
+      writeFileSync(
+        OPENCLAW_JSON,
+        JSON.stringify(config, null, 2) + "\n",
+        "utf-8",
+      );
       ok(`Updated ${OPENCLAW_JSON}`);
     } catch (e) {
       warn(`Could not write ${OPENCLAW_JSON}: ${e.message}`);
@@ -278,7 +305,10 @@ function restartOpenclawGateway() {
     if (process.platform === "darwin") {
       try {
         const uid = execSync("id -u", { stdio: "pipe" }).toString().trim();
-        execSync(`launchctl kickstart -k gui/${uid}/ai.openclaw.gateway`, { stdio: "pipe", timeout: 10000 });
+        execSync(`launchctl kickstart -k gui/${uid}/ai.openclaw.gateway`, {
+          stdio: "pipe",
+          timeout: 10000,
+        });
         ok("OpenClaw gateway restarted (via launchctl)");
       } catch {
         warn("Could not restart OpenClaw gateway — restart it manually:");
@@ -306,19 +336,26 @@ function commandExists(cmd) {
   try {
     execSync(IS_WIN ? `where ${cmd}` : `command -v ${cmd}`, { stdio: "pipe" });
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 function getBunVersion() {
-  try { return execSync("bun --version", { stdio: "pipe" }).toString().trim(); }
-  catch { return null; }
+  try {
+    return execSync("bun --version", { stdio: "pipe" }).toString().trim();
+  } catch {
+    return null;
+  }
 }
 
 if (!commandExists("bun")) {
   if (IS_WIN) {
     info("Bun not found. Installing via PowerShell...");
     try {
-      execSync('powershell -Command "irm bun.sh/install.ps1 | iex"', { stdio: "inherit" });
+      execSync('powershell -Command "irm bun.sh/install.ps1 | iex"', {
+        stdio: "inherit",
+      });
       process.env.PATH = `${join(HOME, ".bun", "bin")};${process.env.PATH}`;
     } catch {
       warn("Auto-install failed. Install manually:");
@@ -328,9 +365,13 @@ if (!commandExists("bun")) {
   } else {
     info("Bun not found. Installing...");
     try {
-      execSync("curl -fsSL https://bun.sh/install | bash", { stdio: "inherit" });
+      execSync("curl -fsSL https://bun.sh/install | bash", {
+        stdio: "inherit",
+      });
       process.env.PATH = `${join(HOME, ".bun", "bin")}:${process.env.PATH}`;
-    } catch { fail("Bun install failed → https://bun.sh"); }
+    } catch {
+      fail("Bun install failed → https://bun.sh");
+    }
   }
 }
 
@@ -346,12 +387,17 @@ if (!commandExists("claude")) {
     execSync("npm install -g @anthropic-ai/claude-code", { stdio: "inherit" });
   } catch {
     try {
-      execSync("bun install -g @anthropic-ai/claude-code", { stdio: "inherit" });
+      execSync("bun install -g @anthropic-ai/claude-code", {
+        stdio: "inherit",
+      });
     } catch {
-      fail("Could not install Claude Code CLI. Install manually: npm install -g @anthropic-ai/claude-code");
+      fail(
+        "Could not install Claude Code CLI. Install manually: npm install -g @anthropic-ai/claude-code",
+      );
     }
   }
-  if (!commandExists("claude")) fail("Claude CLI installed but not in PATH. Restart your terminal.");
+  if (!commandExists("claude"))
+    fail("Claude CLI installed but not in PATH. Restart your terminal.");
 }
 ok("Claude Code CLI found");
 
@@ -359,8 +405,13 @@ ok("Claude Code CLI found");
 let claudeAuthed = false;
 try {
   // claude auth status exits 0 if logged in on some versions
-  const out = execSync("claude auth status", { stdio: "pipe", timeout: 10000 }).toString();
-  claudeAuthed = !out.toLowerCase().includes("not logged in") && !out.toLowerCase().includes("no auth");
+  const out = execSync("claude auth status", {
+    stdio: "pipe",
+    timeout: 10000,
+  }).toString();
+  claudeAuthed =
+    !out.toLowerCase().includes("not logged in") &&
+    !out.toLowerCase().includes("no auth");
 } catch {
   // Command might not exist in older versions, or might exit non-zero if not authed
   claudeAuthed = false;
@@ -369,7 +420,9 @@ try {
 if (!claudeAuthed) {
   console.log("");
   warn("Claude Code CLI is not authenticated.");
-  info("Running 'claude login' — this will open your browser to sign in with Anthropic.");
+  info(
+    "Running 'claude login' — this will open your browser to sign in with Anthropic.",
+  );
   console.log("");
   try {
     execSync("claude login", { stdio: "inherit" });
@@ -393,18 +446,23 @@ let companionProcess = null;
 
 async function isCompanionRunning() {
   try {
-    const res = await fetch(`${companionUrl}/api/sessions`, { signal: AbortSignal.timeout(2000) });
+    const res = await fetch(`${companionUrl}/api/sessions`, {
+      signal: AbortSignal.timeout(2000),
+    });
     return res.ok;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 if (autoCompanion && !(await isCompanionRunning())) {
   info("Starting Companion...");
-  if (!commandExists("npx")) fail("npx not found — install Node.js from https://nodejs.org");
+  if (!commandExists("npx"))
+    fail("npx not found — install Node.js from https://nodejs.org");
 
   const compPort = new URL(companionUrl).port || "3457";
   const npxCmd = IS_WIN ? "npx.cmd" : "npx";
-  companionProcess = spawn(npxCmd, ["@anthropic-ai/claude-code-companion", "--port", compPort], {
+  companionProcess = spawn(npxCmd, ["the-vibe-companion", "--port", compPort], {
     stdio: "ignore",
     detached: !IS_WIN,
     shell: IS_WIN,
@@ -414,11 +472,16 @@ if (autoCompanion && !(await isCompanionRunning())) {
   let ready = false;
   for (let attempt = 0; attempt < 30; attempt++) {
     await new Promise((r) => setTimeout(r, 1000));
-    if (await isCompanionRunning()) { ready = true; break; }
+    if (await isCompanionRunning()) {
+      ready = true;
+      break;
+    }
   }
 
-  if (ready) ok(`Companion started on ${companionUrl} (PID ${companionProcess.pid})`);
-  else warn("Companion didn't start in 30s — adapter will retry on first request");
+  if (ready)
+    ok(`Companion started on ${companionUrl} (PID ${companionProcess.pid})`);
+  else
+    warn("Companion didn't start in 30s — adapter will retry on first request");
 } else if (autoCompanion) {
   ok(`Companion already running at ${companionUrl}`);
 }
@@ -443,7 +506,10 @@ function cleanup() {
   }
   if (companionProcess && !companionProcess.killed) {
     try {
-      if (IS_WIN) execSync(`taskkill /pid ${companionProcess.pid} /T /F`, { stdio: "ignore" });
+      if (IS_WIN)
+        execSync(`taskkill /pid ${companionProcess.pid} /T /F`, {
+          stdio: "ignore",
+        });
       else process.kill(-companionProcess.pid, "SIGTERM");
     } catch {}
     ok("Companion stopped");
