@@ -32,7 +32,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PKG_DIR = resolve(__dirname, "..");
 const ADAPTER_PATH = join(PKG_DIR, "adapter.ts");
-const VERSION = "3.0.2";
+const VERSION = "3.0.4";
 const IS_WIN = process.platform === "win32";
 const HOME = process.env.HOME || process.env.USERPROFILE || "";
 
@@ -110,7 +110,7 @@ ${c.dim("EXAMPLES")}
 }
 
 let adapterPort = env.ADAPTER_PORT || "8787";
-let companionUrl = env.COMPANION_URL || "http://localhost:3457";
+let companionUrl = env.COMPANION_URL || "http://localhost:3456";
 let modelName = env.MODEL_NAME || "claude-code-companion";
 
 let i = 0;
@@ -464,7 +464,7 @@ if (autoCompanion && !(await isCompanionRunning())) {
   const npxCmd = IS_WIN ? "npx.cmd" : "npx";
   companionProcess = spawn(
     npxCmd,
-    ["--yes", "the-vibe-companion", "--port", compPort],
+    ["--yes", "the-vibe-companion", "start", compPort],
     {
       stdio: "ignore",
       detached: !IS_WIN,
