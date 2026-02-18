@@ -65,16 +65,11 @@ const TOOL_MODE = (process.env.TOOL_MODE ?? "auto") as "auto" | "passthrough";
 // Switch at runtime: CONTEXT_STRATEGY=stateful npx companion-bridge
 //
 type ContextStrategyType = "none" | "summary" | "stateful" | "hybrid";
-const VALID_STRATEGIES: ContextStrategyType[] = [
-  "none",
-  "summary",
-  "stateful",
-  "hybrid",
-];
+const VALID_STRATEGIES: ContextStrategyType[] = ["none", "summary", "stateful", "hybrid"];
 
-// Mutable — can be changed at runtime via !bridge chat command
-let CONTEXT_STRATEGY: ContextStrategyType = (process.env.CONTEXT_STRATEGY ??
-  "summary") as ContextStrategyType;
+// Mutable — can be changed at runtime via @bridge chat command
+let CONTEXT_STRATEGY: ContextStrategyType =
+  (process.env.CONTEXT_STRATEGY ?? "summary") as ContextStrategyType;
 
 // Context percentage at which to trigger the first rolling summary compaction.
 // After this threshold, compaction re-triggers every SUMMARY_RECOMPACT_PCT
@@ -86,9 +81,7 @@ let CONTEXT_STRATEGY: ContextStrategyType = (process.env.CONTEXT_STRATEGY ??
 //   80% → re-compact again (final safety net before degradation)
 //
 const SUMMARY_TRIGGER_PCT = parseInt(process.env.SUMMARY_TRIGGER_PCT ?? "40");
-const SUMMARY_RECOMPACT_PCT = parseInt(
-  process.env.SUMMARY_RECOMPACT_PCT ?? "20",
-);
+const SUMMARY_RECOMPACT_PCT = parseInt(process.env.SUMMARY_RECOMPACT_PCT ?? "20");
 
 // Directory where context persistence files live.
 // Defaults to the workspace root — alongside your project files.
@@ -621,10 +614,7 @@ class SessionPool {
       state: s.state,
       model: s.model,
       age: Date.now() - s.lastActivityAt,
-      lifetimeTokens: {
-        input: s.lifetimeInputTokens,
-        output: s.lifetimeOutputTokens,
-      },
+      lifetimeTokens: { input: s.lifetimeInputTokens, output: s.lifetimeOutputTokens },
       lifetimeTurns: s.lifetimeTurns,
       lifetimeCost: s.lifetimeCost,
       contextPct: Math.round((s.lifetimeInputTokens / 200_000) * 100),
@@ -852,15 +842,11 @@ class SessionPool {
         const sessionAge = Math.round((Date.now() - s.createdAt) / 60000);
 
         // Log context health on every result
-        log.info(
-          "context",
-          `Session ${s.key}: ${lastInput.toLocaleString()}/${CONTEXT_LIMIT.toLocaleString()} tokens (${pct}%)`,
-          {
-            lifetimeTurns: s.lifetimeTurns,
-            lifetimeCost: `$${s.lifetimeCost.toFixed(4)}`,
-            sessionAgeMin: sessionAge,
-          },
-        );
+        log.info("context", `Session ${s.key}: ${lastInput.toLocaleString()}/${CONTEXT_LIMIT.toLocaleString()} tokens (${pct}%)`, {
+          lifetimeTurns: s.lifetimeTurns,
+          lifetimeCost: `$${s.lifetimeCost.toFixed(4)}`,
+          sessionAgeMin: sessionAge,
+        });
 
         // Fire warnings at 50%, 70%, 85%, 95% — only once per threshold
         const thresholds = [50, 70, 85, 95];
@@ -998,10 +984,7 @@ class SessionPool {
         return;
       }
       log.info("pool", `Evicting idle session: ${s.key}`);
-      this.destroySession(
-        s.key,
-        `idle-timeout (${SESSION_IDLE_TIMEOUT / 1000}s)`,
-      );
+      this.destroySession(s.key, `idle-timeout (${SESSION_IDLE_TIMEOUT / 1000}s)`);
     }, SESSION_IDLE_TIMEOUT);
   }
 
@@ -1022,8 +1005,7 @@ class SessionPool {
           oldest = s;
         }
       }
-      if (oldest)
-        this.destroySession(oldest.key, `pool-full (max=${MAX_SESSIONS})`);
+      if (oldest) this.destroySession(oldest.key, `pool-full (max=${MAX_SESSIONS})`);
       else break;
     }
   }
@@ -1072,9 +1054,7 @@ class ContextManager {
   constructor() {
     // Ensure context directory exists
     if (!existsSync(CONTEXT_DIR)) {
-      try {
-        mkdirSync(CONTEXT_DIR, { recursive: true });
-      } catch {}
+      try { mkdirSync(CONTEXT_DIR, { recursive: true }); } catch {}
     }
     this.summaryPath = join(CONTEXT_DIR, ".companion-summary.md");
     this.statePath = join(CONTEXT_DIR, ".companion-state.md");
@@ -1105,26 +1085,18 @@ class ContextManager {
   // ── SUMMARY FILE (Strategy 4) ───────────────────────────────────────
 
   /** Read the stored rolling summary from disk. */
-  getSummary(): string {
-    return this.readFile(this.summaryPath);
-  }
+  getSummary(): string { return this.readFile(this.summaryPath); }
 
   /** Persist a new rolling summary to disk. */
-  saveSummary(summary: string): void {
-    this.writeFile(this.summaryPath, summary);
-  }
+  saveSummary(summary: string): void { this.writeFile(this.summaryPath, summary); }
 
   // ── STATE FILE (Strategy 5) ─────────────────────────────────────────
 
   /** Read the stored session state from disk. */
-  getState(): string {
-    return this.readFile(this.statePath);
-  }
+  getState(): string { return this.readFile(this.statePath); }
 
   /** Persist session state to disk (called after CLI writes it). */
-  saveState(state: string): void {
-    this.writeFile(this.statePath, state);
-  }
+  saveState(state: string): void { this.writeFile(this.statePath, state); }
 
   // ── PROMPT INJECTION: BEFORE ────────────────────────────────────────
   //
@@ -1149,22 +1121,17 @@ class ContextManager {
     if (strategy === "summary" || strategy === "hybrid") {
       const summary = this.getSummary();
       if (summary) {
-        parts.push(
-          [
-            "═══ CONTEXT RECOVERY: CONVERSATION SUMMARY ═══",
-            "The following is a summary of our previous conversation before",
-            "this session started. Use it to maintain continuity. Do NOT",
-            "repeat this summary back to the user — just use it as context.",
-            "",
-            summary,
-            "",
-            "═══ END CONVERSATION SUMMARY ═══",
-          ].join("\n"),
-        );
-        log.info(
-          "context-mgr",
-          `Injected summary (${summary.length} chars) into first prompt`,
-        );
+        parts.push([
+          "═══ CONTEXT RECOVERY: CONVERSATION SUMMARY ═══",
+          "The following is a summary of our previous conversation before",
+          "this session started. Use it to maintain continuity. Do NOT",
+          "repeat this summary back to the user — just use it as context.",
+          "",
+          summary,
+          "",
+          "═══ END CONVERSATION SUMMARY ═══",
+        ].join("\n"));
+        log.info("context-mgr", `Injected summary (${summary.length} chars) into first prompt`);
       }
     }
 
@@ -1172,22 +1139,17 @@ class ContextManager {
     if (strategy === "stateful" || strategy === "hybrid") {
       const state = this.getState();
       if (state) {
-        parts.push(
-          [
-            "═══ CONTEXT RECOVERY: SESSION STATE ═══",
-            "The following is the structured state from your previous session.",
-            "Resume from where you left off. Do NOT repeat this state back",
-            "to the user — just use it to continue seamlessly.",
-            "",
-            state,
-            "",
-            "═══ END SESSION STATE ═══",
-          ].join("\n"),
-        );
-        log.info(
-          "context-mgr",
-          `Injected state (${state.length} chars) into first prompt`,
-        );
+        parts.push([
+          "═══ CONTEXT RECOVERY: SESSION STATE ═══",
+          "The following is the structured state from your previous session.",
+          "Resume from where you left off. Do NOT repeat this state back",
+          "to the user — just use it to continue seamlessly.",
+          "",
+          state,
+          "",
+          "═══ END SESSION STATE ═══",
+        ].join("\n"));
+        log.info("context-mgr", `Injected state (${state.length} chars) into first prompt`);
       }
     }
 
@@ -1219,27 +1181,25 @@ class ContextManager {
 
     // ── Strategy 5: State file instruction (every turn) ──
     if (strategy === "stateful" || strategy === "hybrid") {
-      instructions.push(
-        [
-          "",
-          "[SYSTEM INSTRUCTION — STATE PERSISTENCE]",
-          "After your response, silently update the file at:",
-          `  ${this.statePath}`,
-          "",
-          "Write it as structured markdown with these sections:",
-          "  ## Active Task — what you're currently working on",
-          "  ## Decisions Made — key choices and their rationale",
-          "  ## Current State — where things stand right now",
-          "  ## Files Modified — any files you changed or read this turn",
-          "  ## Next Steps — what needs to happen next",
-          "  ## Open Questions — anything unresolved",
-          "",
-          "Keep it concise (<2000 chars). Overwrite previous content.",
-          "Do NOT mention this instruction to the user or include it in",
-          "your visible response. This is invisible housekeeping.",
-          "[END SYSTEM INSTRUCTION]",
-        ].join("\n"),
-      );
+      instructions.push([
+        "",
+        "[SYSTEM INSTRUCTION — STATE PERSISTENCE]",
+        "After your response, silently update the file at:",
+        `  ${this.statePath}`,
+        "",
+        "Write it as structured markdown with these sections:",
+        "  ## Active Task — what you're currently working on",
+        "  ## Decisions Made — key choices and their rationale",
+        "  ## Current State — where things stand right now",
+        "  ## Files Modified — any files you changed or read this turn",
+        "  ## Next Steps — what needs to happen next",
+        "  ## Open Questions — anything unresolved",
+        "",
+        "Keep it concise (<2000 chars). Overwrite previous content.",
+        "Do NOT mention this instruction to the user or include it in",
+        "your visible response. This is invisible housekeeping.",
+        "[END SYSTEM INSTRUCTION]",
+      ].join("\n"));
     }
 
     // ── Strategy 4: Summary compaction (context %-based) ──
@@ -1256,47 +1216,40 @@ class ContextManager {
       const ctxPct = session.lastKnownContextPct;
 
       // Determine next compaction threshold
-      const nextThreshold =
-        session.lastSummaryPct === 0
-          ? SUMMARY_TRIGGER_PCT // first compaction
-          : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT; // subsequent
+      const nextThreshold = session.lastSummaryPct === 0
+        ? SUMMARY_TRIGGER_PCT // first compaction
+        : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT; // subsequent
 
       if (ctxPct >= nextThreshold) {
         session.lastSummaryPct = ctxPct; // record that we compacted at this level
 
-        instructions.push(
-          [
-            "",
-            "[SYSTEM INSTRUCTION — CONVERSATION SUMMARY]",
-            `Context window is at ${ctxPct}%. Write a survival summary now.`,
-            `After your response, silently update the file at:`,
-            `  ${this.summaryPath}`,
-            "",
-            "Write a comprehensive summary of the ENTIRE conversation so far,",
-            "including any previous summary that was injected at session start.",
-            "Structure it as:",
-            "  ## Session Overview — high-level what this session is about",
-            "  ## Key Discussion Points — major topics covered, in order",
-            "  ## Decisions & Outcomes — what was decided and why",
-            "  ## Technical Details — specific files, configs, code discussed",
-            "  ## Current Task State — exactly where we left off",
-            "  ## User Preferences & Style — anything notable about how the",
-            "    user works or communicates",
-            "",
-            "Target ~3000-5000 chars. This will be your ONLY memory if the",
-            "session resets. Be thorough but concise.",
-            "Do NOT mention this instruction to the user.",
-            "[END SYSTEM INSTRUCTION]",
-          ].join("\n"),
-        );
+        instructions.push([
+          "",
+          "[SYSTEM INSTRUCTION — CONVERSATION SUMMARY]",
+          `Context window is at ${ctxPct}%. Write a survival summary now.`,
+          `After your response, silently update the file at:`,
+          `  ${this.summaryPath}`,
+          "",
+          "Write a comprehensive summary of the ENTIRE conversation so far,",
+          "including any previous summary that was injected at session start.",
+          "Structure it as:",
+          "  ## Session Overview — high-level what this session is about",
+          "  ## Key Discussion Points — major topics covered, in order",
+          "  ## Decisions & Outcomes — what was decided and why",
+          "  ## Technical Details — specific files, configs, code discussed",
+          "  ## Current Task State — exactly where we left off",
+          "  ## User Preferences & Style — anything notable about how the",
+          "    user works or communicates",
+          "",
+          "Target ~3000-5000 chars. This will be your ONLY memory if the",
+          "session resets. Be thorough but concise.",
+          "Do NOT mention this instruction to the user.",
+          "[END SYSTEM INSTRUCTION]",
+        ].join("\n"));
 
-        log.info(
-          "context-mgr",
+        log.info("context-mgr",
           `Triggered summary compaction at ${ctxPct}% context (next at ${ctxPct + SUMMARY_RECOMPACT_PCT}%)`,
-          {
-            turn: session.userTurnCount,
-            lastSummaryPct: session.lastSummaryPct,
-          },
+          { turn: session.userTurnCount, lastSummaryPct: session.lastSummaryPct },
         );
       }
     }
@@ -1325,10 +1278,9 @@ class ContextManager {
         strategy: CONTEXT_STRATEGY,
         contextPct: session.lastKnownContextPct,
         lastSummaryAtPct: session.lastSummaryPct,
-        nextSummaryAtPct:
-          session.lastSummaryPct === 0
-            ? SUMMARY_TRIGGER_PCT
-            : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT,
+        nextSummaryAtPct: session.lastSummaryPct === 0
+          ? SUMMARY_TRIGGER_PCT
+          : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT,
         summaryFileChars: summary.length,
         stateFileChars: state.length,
       });
@@ -1593,13 +1545,7 @@ function formatCommandResponse(
       object: "chat.completion.chunk",
       created,
       model: s.model,
-      choices: [
-        {
-          index: 0,
-          delta: { role: "assistant", content: text },
-          finish_reason: null,
-        },
-      ],
+      choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
     });
     const sseDone = JSON.stringify({
       id,
@@ -1741,7 +1687,7 @@ Bun.serve({
       return Response.json(
         {
           status: "ok",
-          version: "3.1.2",
+          version: "3.0.0",
           companion: COMPANION_URL,
           cwd: SESSION_CWD,
           toolMode: TOOL_MODE,
@@ -1807,8 +1753,7 @@ Bun.serve({
 
       // Trace log: session key + context for diagnosing session reuse
       const requestId = req.headers.get("x-request-id");
-      const sysMsg =
-        body.messages.find((m) => m.role === "system")?.content ?? "";
+      const sysMsg = body.messages.find((m) => m.role === "system")?.content ?? "";
       log.info("adapter", `Request → session=${sessionKey}`, {
         requestId: requestId ?? "none",
         model: body.model ?? "none",
@@ -1896,32 +1841,30 @@ Bun.serve({
         );
       }
 
-      // ── !bridge commands — runtime context strategy control ────
+      // ── @bridge commands — runtime context strategy control ────
       //
-      // Uses "!" prefix because OpenClaw intercepts all "/" commands locally
-      // as skill invocations — they never reach the adapter.
+      // Uses "@bridge" prefix — looks like a normal chat message to OpenClaw
+      // so it passes through to the adapter untouched.
+      // OpenClaw intercepts "/" (skills) and "!" (shell), so we avoid both.
       //
-      //   !bridge summary      → switch to rolling summary mode
-      //   !bridge stateful     → switch to external state mode
-      //   !bridge hybrid       → switch to both
-      //   !bridge none         → disable context persistence
-      //   !bridge status       → show current strategy + context health
-      //   !bridge compact      → force a summary compaction now
-      //   !bridge checkpoint   → force a state file write now
-      //   !bridge reset        → destroy session, start fresh (keeps files)
+      //   @bridge summary      → switch to rolling summary mode
+      //   @bridge stateful     → switch to external state mode
+      //   @bridge hybrid       → switch to both
+      //   @bridge none         → disable context persistence
+      //   @bridge status       → show current strategy + context health
+      //   @bridge compact      → force a summary compaction now
+      //   @bridge checkpoint   → force a state file write now
+      //   @bridge reset        → destroy session, start fresh (keeps files)
       //
       const trimmedPrompt = String(prompt).trim().toLowerCase();
-      if (trimmedPrompt.startsWith("!bridge")) {
-        const arg = trimmedPrompt.replace("!bridge", "").trim().split(/\s+/)[0];
+      if (trimmedPrompt.startsWith("@bridge")) {
+        const arg = trimmedPrompt.replace("@bridge", "").trim().split(/\s+/)[0];
 
         // ── Switch strategy ──
         if (VALID_STRATEGIES.includes(arg as ContextStrategyType)) {
           const prev = CONTEXT_STRATEGY;
           CONTEXT_STRATEGY = arg as ContextStrategyType;
-          log.info(
-            "command",
-            `Context strategy changed: ${prev} → ${CONTEXT_STRATEGY}`,
-          );
+          log.info("command", `Context strategy changed: ${prev} → ${CONTEXT_STRATEGY}`);
           const msg = `✅ Context strategy switched from **${prev}** to **${CONTEXT_STRATEGY}**.\n\nThis takes effect immediately — no restart needed.`;
           return formatCommandResponse(msg, session, CORS, wantStream);
         }
@@ -1930,10 +1873,9 @@ Bun.serve({
         if (arg === "status" || arg === "") {
           const summary = contextMgr.getSummary();
           const state = contextMgr.getState();
-          const nextCompact =
-            session.lastSummaryPct === 0
-              ? SUMMARY_TRIGGER_PCT
-              : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT;
+          const nextCompact = session.lastSummaryPct === 0
+            ? SUMMARY_TRIGGER_PCT
+            : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT;
           const msg = [
             `📊 **Context Strategy:** ${CONTEXT_STRATEGY}`,
             `📈 **Context window:** ${session.lastKnownContextPct}% full`,
@@ -1962,10 +1904,7 @@ Bun.serve({
           const prevStrategy = CONTEXT_STRATEGY;
           if (CONTEXT_STRATEGY === "none" || CONTEXT_STRATEGY === "summary") {
             CONTEXT_STRATEGY = "hybrid";
-            log.info(
-              "command",
-              `Switched to ${CONTEXT_STRATEGY} for checkpoint (was ${prevStrategy})`,
-            );
+            log.info("command", `Switched to ${CONTEXT_STRATEGY} for checkpoint (was ${prevStrategy})`);
           }
           const msg = `📋 State checkpoint will be written on your **next message**.\n\nJust send your next prompt — the CLI will write \`${join(CONTEXT_DIR, ".companion-state.md")}\` after responding.`;
           return formatCommandResponse(msg, session, CORS, wantStream);
@@ -1980,16 +1919,16 @@ Bun.serve({
 
         // ── Help ──
         const helpMsg = [
-          "**Available !bridge commands:**",
+          "**Available @bridge commands:**",
           "",
-          "`!bridge status` — show current strategy + context health",
-          "`!bridge summary` — switch to rolling summary mode",
-          "`!bridge stateful` — switch to external state file mode",
-          "`!bridge hybrid` — use both summary + state files",
-          "`!bridge none` — disable context persistence",
-          "`!bridge compact` — force summary compaction on next turn",
-          "`!bridge checkpoint` — force state checkpoint on next turn",
-          "`!bridge reset` — kill session, start fresh (keeps context files)",
+          "`@bridge status` — show current strategy + context health",
+          "`@bridge summary` — switch to rolling summary mode",
+          "`@bridge stateful` — switch to external state file mode",
+          "`@bridge hybrid` — use both summary + state files",
+          "`@bridge none` — disable context persistence",
+          "`@bridge compact` — force summary compaction on next turn",
+          "`@bridge checkpoint` — force state checkpoint on next turn",
+          "`@bridge reset` — kill session, start fresh (keeps context files)",
         ].join("\n");
         return formatCommandResponse(helpMsg, session, CORS, wantStream);
       }
@@ -2122,7 +2061,7 @@ Bun.serve({
 
 console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║  Companion Bridge v3.0                                      ║
+║  Companion Bridge v3.1.3                                    ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Adapter:     http://localhost:${String(ADAPTER_PORT).padEnd(27)}║
 ║  Companion:   ${COMPANION_URL.padEnd(43)}║
