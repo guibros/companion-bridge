@@ -1847,6 +1847,10 @@ Bun.serve({
       // so it passes through to the adapter untouched.
       // OpenClaw intercepts "/" (skills) and "!" (shell), so we avoid both.
       //
+      // Matching is flexible: we check if the ENTIRE trimmed prompt is a
+      // @bridge command, OR if any line in the prompt starts with @bridge.
+      // This handles OpenClaw potentially wrapping/prepending content.
+      //
       //   @bridge summary      → switch to rolling summary mode
       //   @bridge stateful     → switch to external state mode
       //   @bridge hybrid       → switch to both
@@ -1857,8 +1861,15 @@ Bun.serve({
       //   @bridge reset        → destroy session, start fresh (keeps files)
       //
       const trimmedPrompt = String(prompt).trim().toLowerCase();
-      if (trimmedPrompt.startsWith("@bridge")) {
-        const arg = trimmedPrompt.replace("@bridge", "").trim().split(/\s+/)[0];
+
+      // Debug: log what the adapter actually receives so we can diagnose
+      // command interception issues. Shows first 300 chars of prompt.
+      log.info("command", `Prompt received (${trimmedPrompt.length} chars): ${trimmedPrompt.slice(0, 300)}`);
+
+      // Match @bridge as: whole prompt, first line, or any standalone line
+      const bridgeMatch = trimmedPrompt.match(/(?:^|\n)\s*@bridge\b(.*)/);
+      if (bridgeMatch) {
+        const arg = bridgeMatch[1].trim().split(/\s+/)[0];
 
         // ── Switch strategy ──
         if (VALID_STRATEGIES.includes(arg as ContextStrategyType)) {
