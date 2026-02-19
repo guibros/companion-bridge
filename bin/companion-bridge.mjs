@@ -32,7 +32,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PKG_DIR = resolve(__dirname, "..");
 const ADAPTER_PATH = join(PKG_DIR, "adapter.ts");
-const VERSION = "3.0.5";
+const VERSION = JSON.parse(readFileSync(join(PKG_DIR, "package.json"), "utf-8")).version;
 const IS_WIN = process.platform === "win32";
 const HOME = process.env.HOME || process.env.USERPROFILE || "";
 

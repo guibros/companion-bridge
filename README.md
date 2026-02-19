@@ -1,4 +1,6 @@
-# Companion Bridge v3.1.3
+# Companion Bridge
+
+[![npm version](https://img.shields.io/npm/v/companion-bridge.svg)](https://www.npmjs.com/package/companion-bridge)
 
 OpenAI-compatible adapter for [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) via [The Vibe Companion](https://github.com/anthropics/claude-code/tree/main/packages/companion).
 
@@ -169,7 +171,7 @@ Options:
 # Recommended: run without installing
 npx companion-bridge
 
-# Global install
+# Global install (https://www.npmjs.com/package/companion-bridge)
 npm install -g companion-bridge
 companion-bridge
 
@@ -230,17 +232,21 @@ git clone https://github.com/guibros/companion-bridge.git && cd companion-bridge
 
 ## Changelog
 
-### v3.1.3
+### [v3.1.6](https://www.npmjs.com/package/companion-bridge/v/3.1.6)
+
+- Fixed `@bridge` command matching — OpenClaw prepends timestamps to prompts (`[wed 2026-02-18 19:34 gmt-5] @bridge status`), so start-of-line matching never fired. Now matches `@bridge` anywhere in the prompt.
+
+### [v3.1.3](https://www.npmjs.com/package/companion-bridge/v/3.1.3)
 
 - Changed command prefix to `@bridge` — OpenClaw intercepts `/` (skills) and `!` (shell) prefixes
 - Versioning aligned across package.json, startup banner, and README
 
-### v3.1.1
+### [v3.1.1](https://www.npmjs.com/package/companion-bridge/v/3.1.1)
 
 - Fixed `prompt.trim()` crash when OpenClaw sends content as array of objects instead of string
 - Changed command prefix from `/context` to avoid OpenClaw skill interception
 
-### v3.1.0
+### [v3.1.0](https://www.npmjs.com/package/companion-bridge/v/3.1.0)
 
 **Session stability fixes:**
 - Fixed session key derivation — sessions now keyed by `body.model` instead of per-request UUIDs (`x-request-id`) or dynamic system prompt hashes, which were causing a new CLI session on every message
@@ -264,7 +270,7 @@ git clone https://github.com/guibros/companion-bridge.git && cd companion-bridge
 - Manual session reset preserving context files (`@bridge reset`)
 - Commands intercepted before CLI — zero token cost
 
-### v3.0.0
+### [v3.0.0](https://www.npmjs.com/package/companion-bridge/v/3.0.0)
 
 Initial release: session pooling, SSE streaming, tool policy engine, cross-platform auto-setup.
 

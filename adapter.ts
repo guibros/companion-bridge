@@ -29,6 +29,19 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PACKAGE VERSION — read from package.json so it never drifts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const PKG_VERSION = (() => {
+  try {
+    const pkgPath = join(import.meta.dir, "package.json");
+    return JSON.parse(readFileSync(pkgPath, "utf-8")).version as string;
+  } catch {
+    return "unknown";
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION — all overridable via .env or environment variables
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1687,7 +1700,7 @@ Bun.serve({
       return Response.json(
         {
           status: "ok",
-          version: "3.0.0",
+          version: PKG_VERSION,
           companion: COMPANION_URL,
           cwd: SESSION_CWD,
           toolMode: TOOL_MODE,
@@ -1847,9 +1860,9 @@ Bun.serve({
       // so it passes through to the adapter untouched.
       // OpenClaw intercepts "/" (skills) and "!" (shell), so we avoid both.
       //
-      // Matching is flexible: we check if the ENTIRE trimmed prompt is a
-      // @bridge command, OR if any line in the prompt starts with @bridge.
-      // This handles OpenClaw potentially wrapping/prepending content.
+      // Matching is flexible: we search for @bridge anywhere in the prompt
+      // because OpenClaw prepends timestamps like "[wed 2026-02-18 19:34 gmt-5]"
+      // before the user's actual text.
       //
       //   @bridge summary      → switch to rolling summary mode
       //   @bridge stateful     → switch to external state mode
@@ -1866,8 +1879,10 @@ Bun.serve({
       // command interception issues. Shows first 300 chars of prompt.
       log.info("command", `Prompt received (${trimmedPrompt.length} chars): ${trimmedPrompt.slice(0, 300)}`);
 
-      // Match @bridge as: whole prompt, first line, or any standalone line
-      const bridgeMatch = trimmedPrompt.match(/(?:^|\n)\s*@bridge\b(.*)/);
+      // Match @bridge anywhere — OpenClaw prepends a timestamp like
+      // "[wed 2026-02-18 19:34 gmt-5] @bridge status" so we can't
+      // rely on start-of-line matching.
+      const bridgeMatch = trimmedPrompt.match(/@bridge\b(.*)/);
       if (bridgeMatch) {
         const arg = bridgeMatch[1].trim().split(/\s+/)[0];
 
@@ -2072,7 +2087,7 @@ Bun.serve({
 
 console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║  Companion Bridge v3.1.3                                    ║
+║  Companion Bridge v${PKG_VERSION.padEnd(40)}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Adapter:     http://localhost:${String(ADAPTER_PORT).padEnd(27)}║
 ║  Companion:   ${COMPANION_URL.padEnd(43)}║
