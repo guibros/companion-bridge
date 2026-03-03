@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * Companion Bridge v3 — OpenAI-Compatible Adapter for Claude Code CLI
+ * Companion Bridge v3.2.0 — OpenAI-Compatible Adapter for Claude Code CLI
  * ============================================================================
  *
  * Bridges any OpenAI-compatible client (OpenClaw, Continue, etc.) to the
@@ -18,6 +18,11 @@
  *   • SHA-256 deterministic session key derivation
  *   • Structured logging (pretty for terminals, JSON for aggregators)
  *   • Immediate error propagation — no silent failures
+ *   • Zombie response detection + auto-recovery (v3.2.0)
+ *   • Prompt size ceiling — rejects oversized payloads pre-flight (v3.2.0)
+ *   • Context-pressure-aware soft lifecycle management (v3.2.0)
+ *   • Heartbeat isolation — monitoring prompts don't pollute context (v3.2.0)
+ *   • Heuristic context % fallback when token reporting fails (v3.2.0)
  *
  * REQUIRES: Bun >= 1.0, The Vibe Companion running on COMPANION_URL
  * CONFIG:   See .env.example for all knobs
@@ -47,6 +52,11 @@ const PKG_VERSION = (() => {
 
 const COMPANION_URL = process.env.COMPANION_URL ?? "http://localhost:3457";
 const ADAPTER_PORT = parseInt(process.env.ADAPTER_PORT ?? "8787");
+// Bind to loopback only — this adapter has no authentication and MUST NOT
+// be exposed to the network. ADAPTER_HOST=0.0.0.0 would open it to anyone
+// on the LAN/tailnet. Only override if you know what you're doing AND have
+// added a bearer token or reverse proxy in front.
+const ADAPTER_HOST = process.env.ADAPTER_HOST ?? "127.0.0.1";
 const SESSION_CWD =
   process.env.SESSION_CWD ?? `${process.env.HOME}/.openclaw/workspace`;
 const PERMISSION_MODE = process.env.PERMISSION_MODE ?? "default";
@@ -60,6 +70,49 @@ const SESSION_IDLE_TIMEOUT = parseInt(
 ); // 30 min — how long an idle session lives before eviction
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS ?? "10");
 const TOOL_MODE = (process.env.TOOL_MODE ?? "auto") as "auto" | "passthrough";
+
+// ── Session Resilience (v3.2.0) ───────────────────────────────────────
+//
+// MAX_PROMPT_CHARS: Maximum prompt size in characters before we reject it
+//   pre-flight. ~50k chars ≈ ~12-15k tokens. Prevents sending prompts
+//   that will choke the companion and brick the session (the 97KB mesh
+//   script incident from 2026-03-02).
+//
+// SESSION_SOFT_MAX_AGE_MS: Soft max session age. NOT a hard wall — only
+//   triggers recycling when the session is idle AND task-complete AND
+//   context pressure exists. Falls back to turn-count heuristic when
+//   context tracking is broken (the 0% blind-sensor bug).
+//
+// MAX_ZOMBIE_RETRIES: Max retries when zombie detection triggers session
+//   recreation. Prevents infinite destroy→retry→destroy loops when the
+//   companion is persistently failing.
+//
+const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS ?? "50000");
+const SESSION_SOFT_MAX_AGE_MS = parseInt(
+  process.env.SESSION_SOFT_MAX_AGE_MS ?? String(4 * 60 * 60 * 1000), // 4h default
+);
+const MAX_ZOMBIE_RETRIES = parseInt(process.env.MAX_ZOMBIE_RETRIES ?? "2");
+
+// Patterns that indicate the companion choked on the prompt.
+// "Prompt is too long" = exactly 18 chars — the 200 OK response that bricked
+// the session on 2026-03-02. The companion returns these as plain text in a
+// 200 OK instead of a proper error code.
+const CHOKE_PATTERNS: RegExp[] = [
+  /^Prompt is too long$/,
+  /^I (cannot|can't) process/,
+  /^context.*(full|exceeded|limit)/i,
+  /^(Error|error):?\s*(context|token|prompt).*(limit|exceeded|full|long)/i,
+];
+
+// Patterns that identify heartbeat/monitoring prompts from OpenClaw.
+// These get short-circuited with a canned response to avoid polluting
+// the main conversation context. Over 25 hours, 48+ heartbeats silently
+// added ~24-48k tokens of noise — enough to brick a session on its own.
+const HEARTBEAT_PATTERNS: RegExp[] = [
+  /read heartbeat\.md/i,
+  /^heartbeat_ok$/i,
+  /if nothing needs attention/i,
+];
 
 // ── Context Persistence Strategy ──────────────────────────────────────
 //
@@ -99,6 +152,10 @@ const SUMMARY_RECOMPACT_PCT = parseInt(process.env.SUMMARY_RECOMPACT_PCT ?? "20"
 // Directory where context persistence files live.
 // Defaults to the workspace root — alongside your project files.
 const CONTEXT_DIR = process.env.CONTEXT_DIR ?? SESSION_CWD;
+
+// Context window limit for the CLI model (tokens).
+// Used for percentage calculations and lifecycle decisions.
+const CONTEXT_LIMIT = 200_000;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STRUCTURED LOGGER
@@ -295,6 +352,8 @@ interface CompanionResultMsg {
     errors?: string[];
     total_cost_usd: number;
     num_turns: number;
+    stop_reason?: string;
+    finish_reason?: string;
     usage: {
       input_tokens: number;
       output_tokens: number;
@@ -428,17 +487,21 @@ interface ManagedSession {
   currentCost: number;
   currentTurns: number;
   // ── Cumulative lifetime counters (never reset, grow until session dies) ──
-  lifetimeInputTokens: number; // Total input tokens across all requests
-  lifetimeOutputTokens: number; // Total output tokens across all requests
-  lifetimeTurns: number; // Total CLI turns across all requests
-  lifetimeCost: number; // Total cost across all requests
-  lastContextWarningPct: number; // Last warning threshold we fired (70, 80, 90)
+  lifetimeInputTokens: number;
+  lifetimeOutputTokens: number;
+  lifetimeTurns: number;
+  lifetimeCost: number;
+  lastContextWarningPct: number;
   // ── Context persistence tracking ──
-  userTurnCount: number; // User turns in this session (for logging)
-  lastSummaryPct: number; // Context % at which last compaction was triggered
-  lastKnownContextPct: number; // Most recent context window usage % (from last turn's input_tokens)
-  contextRecoveryDone: boolean; // Whether we already injected recovered context
-  isSyntheticTurn: boolean; // True when processing a summary/state request, not user input
+  userTurnCount: number;
+  lastSummaryPct: number;
+  lastKnownContextPct: number;
+  contextRecoveryDone: boolean;
+  isSyntheticTurn: boolean;
+  lastDailyLogTurn: number;         // Last turn where daily log instruction was injected
+  // ── Lifecycle management (v3.2.0) ──
+  lastFinishReason: string | null; // "stop" = task done, "tool_use" = mid-chain
+  zombieRetryCount: number;        // How many zombie recoveries this session has had
   // ── Promise plumbing ──
   pendingResolve: ((v: SessionResponse) => void) | null;
   pendingReject: ((e: Error) => void) | null;
@@ -503,6 +566,10 @@ class SessionPool {
       lastKnownContextPct: 0,
       contextRecoveryDone: false,
       isSyntheticTurn: false,
+      lastDailyLogTurn: 0,
+      // v3.2.0 — lifecycle management
+      lastFinishReason: null,
+      zombieRetryCount: 0,
       pendingResolve: null,
       pendingReject: null,
       pendingPermissions: new Map(),
@@ -608,29 +675,30 @@ class SessionPool {
       reason,
       idleSec: age,
       companionSession: s.companionSessionId,
+      lifetimeTurns: s.lifetimeTurns,
+      contextPct: s.lastKnownContextPct,
     });
   }
 
-  /** List sessions for the /health endpoint. */
-  listSessions(): {
-    key: string;
-    state: SessionState;
-    model: string;
-    age: number;
-    lifetimeTokens: { input: number; output: number };
-    lifetimeTurns: number;
-    lifetimeCost: number;
-    contextPct: number;
-  }[] {
+  /** List sessions for the /health endpoint — enriched with lifecycle info (v3.2.0). */
+  listSessions(): object[] {
     return Array.from(this.sessions.values()).map((s) => ({
       key: s.key,
       state: s.state,
       model: s.model,
       age: Date.now() - s.lastActivityAt,
+      ageMin: Math.round((Date.now() - s.createdAt) / 60000),
+      // ── Context health ──
+      contextPct: s.lastKnownContextPct,
+      contextTrackingHealthy: s.lastKnownContextPct > 0 || s.lifetimeTurns < 5,
+      // ── Lifetime stats ──
       lifetimeTokens: { input: s.lifetimeInputTokens, output: s.lifetimeOutputTokens },
       lifetimeTurns: s.lifetimeTurns,
       lifetimeCost: s.lifetimeCost,
-      contextPct: Math.round((s.lifetimeInputTokens / 200_000) * 100),
+      // ── Lifecycle status (v3.2.0) ──
+      lastFinishReason: s.lastFinishReason,
+      zombieRetryCount: s.zombieRetryCount,
+      shouldRecycle: shouldRecycleSession(s),
     }));
   }
 
@@ -737,7 +805,7 @@ class SessionPool {
       // ── Assistant response: accumulate text + fire deltas ──────────
       case "assistant": {
         const m = msg as CompanionAssistantMsg;
-        s.lastActivityAt = Date.now(); // keep session alive during multi-turn responses
+        s.lastActivityAt = Date.now();
         if (m.parent_tool_use_id) break; // skip sub-agent messages
 
         // Extract text blocks
@@ -750,7 +818,7 @@ class SessionPool {
           }
         }
 
-        // Accumulate token usage
+        // Accumulate token usage from per-message events
         if (m.message?.usage) {
           s.currentUsage.input += m.message.usage.input_tokens;
           s.currentUsage.output += m.message.usage.output_tokens;
@@ -765,7 +833,7 @@ class SessionPool {
       // ── Tool permission: evaluate policy → allow/deny/passthrough ──
       case "permission_request": {
         const m = msg as CompanionPermissionMsg;
-        s.lastActivityAt = Date.now(); // keep session alive during long tool chains
+        s.lastActivityAt = Date.now();
         const decision = evaluateToolPolicy(
           m.request.tool_name,
           m.request.input,
@@ -811,7 +879,6 @@ class SessionPool {
           s.state = "waiting_tool_decision";
           if (s.timeoutHandle) clearTimeout(s.timeoutHandle);
 
-          // Resolve current HTTP request with the pending tool calls
           s.pendingResolve?.({
             text: s.currentText,
             model: s.model,
@@ -828,16 +895,44 @@ class SessionPool {
       }
 
       // ── Result: task complete, resolve the pending promise ─────────
+      //
+      // v3.2.0 FIX: Context sensor now uses Math.max() across both
+      // per-message and result-level usage to avoid the 0/0 blindspot.
+      // Also adds heuristic fallback when token reporting fails entirely.
+      //
       case "result": {
         const m = msg as CompanionResultMsg;
         s.currentCost = m.data.total_cost_usd;
         s.currentTurns = m.data.num_turns;
 
-        // Use result-level usage as fallback if per-message wasn't tracked
-        if (s.currentUsage.input === 0 && m.data.usage) {
-          s.currentUsage.input = m.data.usage.input_tokens;
-          s.currentUsage.output = m.data.usage.output_tokens;
-        }
+        // ── Token tracking: prefer result-level (actual context size) ──
+        //
+        // [Daedalus audit 2026-03-02] Changed from Math.max(accumulated, result)
+        // to result-first with accumulated fallback. The old approach summed
+        // input tokens across ALL internal tool-loop turns (5 turns × 50K =
+        // 250K), inflating contextPct past 100% and triggering premature
+        // session recycling. Result-level reports the actual last-turn prompt
+        // size — the true "how full is the window" signal. Accumulated is
+        // only used when result reports 0 (the blind-sensor bug). The
+        // heuristic fallback below (60% of lifetime) is the final safety net.
+        //
+        // Result-level usage reflects the LAST turn's full prompt — i.e.,
+        // how full the context window actually is right now.
+        //
+        // Per-message accumulated usage (currentUsage) is the SUM across
+        // all internal turns (tool loops), which inflates the number and
+        // would trigger premature recycling.
+        //
+        // Use result-level as primary. Fall back to accumulated only when
+        // result reports 0 (the blind-sensor scenario).
+        //
+        const resultUsage = m.data.usage ?? { input_tokens: 0, output_tokens: 0 };
+        s.currentUsage.input = resultUsage.input_tokens > 0
+          ? resultUsage.input_tokens
+          : s.currentUsage.input;
+        s.currentUsage.output = resultUsage.output_tokens > 0
+          ? resultUsage.output_tokens
+          : s.currentUsage.output;
 
         // ── Accumulate lifetime counters (never reset) ──
         s.lifetimeInputTokens += s.currentUsage.input;
@@ -845,17 +940,43 @@ class SessionPool {
         s.lifetimeTurns += s.currentTurns;
         s.lifetimeCost += s.currentCost;
 
-        // ── Context window awareness: WARN, never auto-reset ──
-        // The last input_tokens count reflects how full the CLI's context is.
-        // We warn at thresholds so you can decide when to manually reset.
-        const CONTEXT_LIMIT = 200_000;
-        const lastInput = s.currentUsage.input; // most recent turn's input = context size
-        const pct = Math.round((lastInput / CONTEXT_LIMIT) * 100);
-        s.lastKnownContextPct = pct; // persist for ContextManager's compaction decisions
+        // ── Track finish reason for lifecycle decisions (v3.2.0) ──
+        // "stop" = task complete, safe to recycle.
+        // "tool_use" = mid-chain, do NOT recycle.
+        s.lastFinishReason = m.data.stop_reason ?? m.data.finish_reason ?? null;
+
+        // ── Context window percentage: multi-source calculation ──
+        //
+        // The input_tokens on the last turn reflects how full the context
+        // window actually is — it's the total prompt the CLI assembled.
+        //
+        const lastInput = s.currentUsage.input;
+        let pct = Math.round((lastInput / CONTEXT_LIMIT) * 100);
+
+        // ── HEURISTIC FALLBACK (v3.2.0) ──
+        //
+        // If input tokens came back as 0 (the exact bug from 2026-03-02:
+        // 204 turns, $473, contextPct: 0%), estimate from lifetime
+        // accumulation. Less accurate but prevents the blind-sensor
+        // scenario where no warnings ever fire.
+        //
+        if (lastInput === 0 && s.lifetimeTurns > 3) {
+          // Assume ~60% of lifetime input tokens are still in context.
+          // The CLI does some internal truncation, but we'd rather
+          // overestimate than report 0% when we're actually full.
+          const estimatedContext = s.lifetimeInputTokens * 0.6;
+          pct = Math.round((estimatedContext / CONTEXT_LIMIT) * 100);
+          log.warn("context", `Token reporting returned 0 — using heuristic: ~${pct}%`, {
+            lifetimeInputTokens: s.lifetimeInputTokens,
+            lifetimeTurns: s.lifetimeTurns,
+          });
+        }
+
+        s.lastKnownContextPct = pct;
         const sessionAge = Math.round((Date.now() - s.createdAt) / 60000);
 
         // Log context health on every result
-        log.info("context", `Session ${s.key}: ${lastInput.toLocaleString()}/${CONTEXT_LIMIT.toLocaleString()} tokens (${pct}%)`, {
+        log.info("context", `Session ${s.key}: ~${pct}% (${lastInput.toLocaleString()} tokens)`, {
           lifetimeTurns: s.lifetimeTurns,
           lifetimeCost: `$${s.lifetimeCost.toFixed(4)}`,
           sessionAgeMin: sessionAge,
@@ -867,14 +988,15 @@ class SessionPool {
           if (pct >= t && s.lastContextWarningPct < t) {
             s.lastContextWarningPct = t;
             const emoji = t >= 85 ? "🔴" : t >= 70 ? "🟡" : "🟢";
-            const msg = `${emoji} Context window: ${pct}% (${lastInput.toLocaleString()} tokens). ${
+            const warnMsg = `${emoji} Context window: ${pct}% (${lastInput.toLocaleString()} tokens). ${
               t >= 85
                 ? "Consider wrapping up current task and starting a fresh session."
-                : "Monitoring."
+                : t >= 70
+                  ? "Getting full — plan your exit."
+                  : "Monitoring."
             }`;
-            log.warn("context", msg);
-            // Push to SSE so TUI shows it in real time
-            s.onProgress?.({ kind: "thinking", status: msg });
+            log.warn("context", warnMsg);
+            s.onProgress?.({ kind: "thinking", status: warnMsg });
           }
         }
 
@@ -916,18 +1038,16 @@ class SessionPool {
           s.pendingReject = null;
           s.state = "dead";
         }
-        // During startup, the Companion may fire this before CLI is ready — ignore.
         break;
       }
 
       // ── Stream events: real-time block/token-level indicators ──────
       case "stream_event": {
         const m = msg as CompanionStreamEventMsg;
-        if (m.parent_tool_use_id) break; // skip sub-agent streams
+        if (m.parent_tool_use_id) break;
 
         const evt = m.event;
 
-        // Block start → signal what Claude is doing
         if (evt.type === "content_block_start" && evt.content_block) {
           if (evt.content_block.type === "thinking") {
             log.info("stream", "🧠 Thinking...");
@@ -940,7 +1060,6 @@ class SessionPool {
           }
         }
 
-        // Thinking delta → log activity (don't expose internal reasoning)
         if (
           evt.type === "content_block_delta" &&
           evt.delta?.type === "thinking_delta" &&
@@ -949,7 +1068,6 @@ class SessionPool {
           log.info("stream", `🧠 (thinking ${evt.delta.text.length} chars)`);
         }
 
-        // Message lifecycle
         if (evt.type === "message_start") {
           log.info("stream", "▶️ New message turn");
           s.onProgress?.({ kind: "thinking", status: "Processing..." });
@@ -987,15 +1105,26 @@ class SessionPool {
   /**
    * Race-safe idle timer: never evicts a session that's currently working.
    * If the timer fires while the session is busy, it reschedules itself.
+   *
+   * v3.2.0: Also checks soft lifecycle before standard idle eviction.
    */
   private resetIdleTimer(s: ManagedSession): void {
     if (s.idleHandle) clearTimeout(s.idleHandle);
     s.idleHandle = setTimeout(() => {
       if (s.state === "busy" || s.state === "waiting_tool_decision") {
         log.info("pool", `Session ${s.key} is busy, postponing eviction`);
-        this.resetIdleTimer(s); // try again later
+        this.resetIdleTimer(s);
         return;
       }
+
+      // v3.2.0: Check context-pressure lifecycle before standard idle eviction.
+      // This catches sessions that should be recycled (90%+ context, blind tracker, etc.)
+      if (shouldRecycleSession(s)) {
+        log.info("lifecycle", `Recycling session ${s.key} on idle check (context-pressure)`);
+        this.destroySession(s.key, "lifecycle-recycle-idle");
+        return;
+      }
+
       log.info("pool", `Evicting idle session: ${s.key}`);
       this.destroySession(s.key, `idle-timeout (${SESSION_IDLE_TIMEOUT / 1000}s)`);
     }, SESSION_IDLE_TIMEOUT);
@@ -1003,11 +1132,9 @@ class SessionPool {
 
   /** Enforce pool size limit by evicting oldest idle sessions. */
   private evictIfNeeded(): void {
-    // Clean up dead sessions first
     for (const [k, s] of this.sessions) {
       if (s.state === "dead") this.destroySession(k, "dead-cleanup");
     }
-    // Evict oldest idle if still over limit
     while (this.sessions.size >= MAX_SESSIONS) {
       let oldest: ManagedSession | null = null;
       for (const s of this.sessions.values()) {
@@ -1031,51 +1158,268 @@ class SessionPool {
 const pool = new SessionPool();
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SESSION RESILIENCE — ZOMBIE DETECTION, LIFECYCLE, GUARDS (v3.2.0)
+//
+// Three layers of protection against the session-bricking bug:
+//
+//   Layer 1 — Pre-flight: Reject oversized prompts before they reach the CLI
+//   Layer 2 — Post-flight: Detect zombie responses and auto-recover
+//   Layer 3 — Lifecycle: Recycle sessions based on context pressure, not clocks
+//
+// Plus: heartbeat isolation to prevent monitoring from polluting context.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * LAYER 1: Pre-flight prompt size check.
+ *
+ * Rejects prompts over MAX_PROMPT_CHARS before they can brick a session.
+ * Returns a Response to send back, or null if the prompt is fine.
+ */
+function checkPromptSize(prompt: string, headers: Record<string, string>): Response | null {
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    log.warn("adapter", `Prompt rejected: ${prompt.length} chars exceeds ${MAX_PROMPT_CHARS} limit`);
+    return Response.json(
+      {
+        error: {
+          message:
+            `Prompt too large: ${prompt.length.toLocaleString()} chars ` +
+            `(max ${MAX_PROMPT_CHARS.toLocaleString()}). ` +
+            `This would likely brick the session. ` +
+            `Split the content into smaller chunks or use file-based input.`,
+          type: "invalid_request_error",
+        },
+      },
+      { status: 413, headers },
+    );
+  }
+  return null;
+}
+
+/**
+ * LAYER 2: Zombie response detection.
+ *
+ * Checks whether a response indicates the session is dead/unrecoverable.
+ * Two signals:
+ *   1. Zero tokens reported AND non-trivial prompt (the 0/0 blindspot)
+ *   2. Response body matches known choke patterns ("Prompt is too long")
+ */
+function isZombieResponse(
+  responseText: string,
+  inputTokens: number,
+  outputTokens: number,
+  promptLength: number,
+): boolean {
+  // Signal 1: Zero tokens on a non-trivial prompt
+  const zeroTokens = inputTokens === 0 && outputTokens === 0 && promptLength > 10;
+
+  // Signal 2: Response matches a known choke pattern
+  const chokeMatch = CHOKE_PATTERNS.some((p) => p.test(responseText.trim()));
+
+  return zeroTokens || chokeMatch;
+}
+
+/**
+ * LAYER 2: Zombie-aware prompt sender with retry + cap.
+ *
+ * Wraps pool.sendPrompt() with zombie detection. If a zombie response is
+ * detected, destroys the session, creates a fresh one, and retries.
+ * Capped at MAX_ZOMBIE_RETRIES to prevent infinite destroy→retry loops.
+ */
+async function sendWithZombieRecovery(
+  sessionKey: string,
+  session: ManagedSession,
+  prompt: string,
+  model: string,
+): Promise<{ result: SessionResponse; session: ManagedSession }> {
+
+  let currentSession = session;
+  let attempts = 0;
+
+  while (attempts <= MAX_ZOMBIE_RETRIES) {
+    const result = await pool.sendPrompt(currentSession, prompt);
+
+    // Check for zombie response
+    if (isZombieResponse(result.text, result.inputTokens, result.outputTokens, prompt.length)) {
+      attempts++;
+      log.warn("adapter", `🧟 Zombie response detected (attempt ${attempts}/${MAX_ZOMBIE_RETRIES})`, {
+        responseText: result.text.slice(0, 50),
+        tokens: `${result.inputTokens}/${result.outputTokens}`,
+        promptChars: prompt.length,
+        session: sessionKey,
+      });
+
+      if (attempts > MAX_ZOMBIE_RETRIES) {
+        // Give up — surface the error clearly to the user
+        log.error("adapter", `Session unrecoverable after ${MAX_ZOMBIE_RETRIES} retries`);
+        pool.destroySession(sessionKey, "zombie-unrecoverable");
+        throw new Error(
+          `Session unrecoverable — companion returned "${result.text.slice(0, 40)}" ` +
+          `after ${MAX_ZOMBIE_RETRIES} fresh session attempts. ` +
+          `Try restarting companion-bridge.`
+        );
+      }
+
+      // Destroy the dead session, spin up a fresh one
+      pool.destroySession(sessionKey, "zombie-detected");
+      currentSession = await pool.getSession(sessionKey, model);
+      currentSession.zombieRetryCount = attempts;
+
+      // Small backoff before retry
+      await new Promise((r) => setTimeout(r, 1000 * attempts));
+      continue;
+    }
+
+    // Response looks healthy — reset zombie counter and return
+    currentSession.zombieRetryCount = 0;
+    return { result, session: currentSession };
+  }
+
+  throw new Error("Zombie recovery loop exited unexpectedly");
+}
+
+/**
+ * LAYER 3: Context-pressure-aware soft lifecycle management.
+ *
+ * Determines whether a session should be recycled based on context pressure,
+ * age, and task state. NEVER recycles a session that's mid-task.
+ *
+ * Decision tree:
+ *   - If busy or mid-tool-chain → NEVER recycle (task safety)
+ *   - If context tracking healthy (reports non-zero):
+ *       → Recycle when context ≥ 90% AND idle AND task done
+ *   - If context tracking broken (reports 0% after many turns):
+ *       → Fallback: recycle when age > soft max AND turns > 150 AND idle
+ *   - Otherwise → keep alive
+ */
+function shouldRecycleSession(s: ManagedSession): boolean {
+  // Absolute safety: never recycle a working session
+  const isIdle = s.state === "ready";
+  const taskComplete = s.lastFinishReason === "stop" || s.lastFinishReason === null;
+
+  if (!isIdle || !taskComplete) return false;
+
+  // Context tracking healthy? (reports non-zero, or session is too young to tell)
+  const contextTrackingHealthy = s.lastKnownContextPct > 0 || s.lifetimeTurns < 5;
+
+  if (contextTrackingHealthy) {
+    // Context pressure is the primary signal — age doesn't matter.
+    // Recycle at 90%+ context when idle and task complete.
+    if (s.lastKnownContextPct >= 90) {
+      log.info("lifecycle", `Session ${s.key} at ${s.lastKnownContextPct}% context — recycling`, {
+        lifetimeTurns: s.lifetimeTurns,
+        ageMin: Math.round((Date.now() - s.createdAt) / 60000),
+      });
+      return true;
+    }
+    return false; // Context is fine, keep alive regardless of age
+  }
+
+  // Context tracking is BROKEN (0% after many turns).
+  // This is the exact scenario from 2026-03-02: 204 turns, $473, contextPct: 0%.
+  // Fall back to age + turn count as a safety net.
+  const isOld = Date.now() - s.createdAt > SESSION_SOFT_MAX_AGE_MS;
+  const manyTurns = s.lifetimeTurns > 150;
+
+  if (isOld && manyTurns) {
+    log.warn("lifecycle", `Session ${s.key} context tracking blind — recycling on fallback`, {
+      lifetimeTurns: s.lifetimeTurns,
+      ageMin: Math.round((Date.now() - s.createdAt) / 60000),
+      lastKnownContextPct: s.lastKnownContextPct,
+    });
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * HEARTBEAT ISOLATION: Detect monitoring prompts from OpenClaw.
+ *
+ * Returns true if the prompt is a heartbeat/keepalive that should be
+ * short-circuited without touching the main conversation session.
+ */
+function isHeartbeatPrompt(prompt: string): boolean {
+  return HEARTBEAT_PATTERNS.some((p) => p.test(prompt.trim()));
+}
+
+/**
+ * HEARTBEAT ISOLATION: Return a synthetic response without consuming context.
+ *
+ * Supports both streaming (SSE) and non-streaming (JSON) so the response
+ * renders correctly regardless of how the client is connected.
+ */
+function createHeartbeatResponse(
+  prompt: string,
+  stream: boolean,
+  headers: Record<string, string>,
+): Response {
+  log.info("adapter", "💓 Heartbeat detected — short-circuiting (no context consumed)");
+
+  const responseText = "heartbeat_ok";
+  const id = `chatcmpl-hb-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (stream) {
+    const chunks = [
+      `data: ${JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: "companion-heartbeat",
+        choices: [{ index: 0, delta: { role: "assistant", content: responseText }, finish_reason: null }],
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: "companion-heartbeat",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 },
+      })}\n\n`,
+      `data: [DONE]\n\n`,
+    ];
+    return new Response(chunks.join(""), {
+      headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+    });
+  }
+
+  return Response.json(
+    {
+      id,
+      object: "chat.completion",
+      created,
+      model: "companion-heartbeat",
+      choices: [{ index: 0, message: { role: "assistant", content: responseText }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 },
+    },
+    { headers },
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONTEXT MANAGER
 //
-// Preserves conversational context across session resets using two strategies
-// that can run independently or together:
-//
-//   Strategy 4 — Rolling Summary (CONTEXT_STRATEGY=summary):
-//     Periodically asks the CLI to summarize the conversation. Stores the
-//     summary on disk. On session reset, injects it into the first prompt
-//     so the new CLI has compressed memory of everything before.
-//
-//   Strategy 5 — External State (CONTEXT_STRATEGY=stateful):
-//     After every response, appends an instruction for the CLI to write
-//     structured state to a known file. On session reset, reads the state
-//     file and injects it. The CLI's "brain" lives on disk, not in context.
-//
-//   Hybrid (CONTEXT_STRATEGY=hybrid):
-//     Both. Summary provides conversational color ("the user was frustrated
-//     about Docker"), state provides structured tracking ("current task:
-//     install Postgres via Homebrew, Phase 04 step 2 of 5").
-//
-// DESIGN PRINCIPLES:
-//   • Never block the user's turn. Summary/state requests are appended to
-//     the user's prompt, not sent as separate blocking messages.
-//   • Never auto-reset sessions. Context manager only reads/writes files
-//     and modifies prompts. Session lifecycle is handled by SessionPool.
-//   • Files survive everything — process crash, session eviction, reboot.
-//   • Strategy 5 can be activated per-environment via CONTEXT_STRATEGY env.
+// Preserves conversational context across session resets.
+// (Unchanged from v3.1.x — see original comments for full documentation.)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class ContextManager {
   private summaryPath: string;
   private statePath: string;
+  private memoryDir: string;
 
   constructor() {
-    // Ensure context directory exists
     if (!existsSync(CONTEXT_DIR)) {
       try { mkdirSync(CONTEXT_DIR, { recursive: true }); } catch {}
     }
     this.summaryPath = join(CONTEXT_DIR, ".companion-summary.md");
     this.statePath = join(CONTEXT_DIR, ".companion-state.md");
+    this.memoryDir = join(CONTEXT_DIR, "memory");
+    if (!existsSync(this.memoryDir)) {
+      try { mkdirSync(this.memoryDir, { recursive: true }); } catch {}
+    }
   }
 
-  // ── FILE I/O ────────────────────────────────────────────────────────
-
-  /** Read a context file, returning empty string if missing or unreadable. */
   private readFile(path: string): string {
     try {
       if (existsSync(path)) return readFileSync(path, "utf-8").trim();
@@ -1085,7 +1429,6 @@ class ContextManager {
     return "";
   }
 
-  /** Write a context file. Overwrites previous content. */
   private writeFile(path: string, content: string): void {
     try {
       writeFileSync(path, content, "utf-8");
@@ -1095,42 +1438,19 @@ class ContextManager {
     }
   }
 
-  // ── SUMMARY FILE (Strategy 4) ───────────────────────────────────────
-
-  /** Read the stored rolling summary from disk. */
   getSummary(): string { return this.readFile(this.summaryPath); }
-
-  /** Persist a new rolling summary to disk. */
   saveSummary(summary: string): void { this.writeFile(this.summaryPath, summary); }
-
-  // ── STATE FILE (Strategy 5) ─────────────────────────────────────────
-
-  /** Read the stored session state from disk. */
   getState(): string { return this.readFile(this.statePath); }
-
-  /** Persist session state to disk (called after CLI writes it). */
   saveState(state: string): void { this.writeFile(this.statePath, state); }
 
-  // ── PROMPT INJECTION: BEFORE ────────────────────────────────────────
-  //
-  // Called before sending a user prompt. Decides what context to prepend
-  // based on the active strategy and session state.
-
-  /**
-   * Wrap the user's prompt with any recovered context.
-   * Only injects on the FIRST turn of a new session (contextRecoveryDone=false).
-   */
   wrapPromptWithContext(prompt: string, session: ManagedSession): string {
     const strategy = CONTEXT_STRATEGY;
     if (strategy === "none") return prompt;
-
-    // Only inject recovered context on the first turn of a new session
     if (session.contextRecoveryDone) return prompt;
     session.contextRecoveryDone = true;
 
     const parts: string[] = [];
 
-    // ── Strategy 4: Inject rolling summary ──
     if (strategy === "summary" || strategy === "hybrid") {
       const summary = this.getSummary();
       if (summary) {
@@ -1139,16 +1459,13 @@ class ContextManager {
           "The following is a summary of our previous conversation before",
           "this session started. Use it to maintain continuity. Do NOT",
           "repeat this summary back to the user — just use it as context.",
-          "",
-          summary,
-          "",
+          "", summary, "",
           "═══ END CONVERSATION SUMMARY ═══",
         ].join("\n"));
         log.info("context-mgr", `Injected summary (${summary.length} chars) into first prompt`);
       }
     }
 
-    // ── Strategy 5: Inject external state ──
     if (strategy === "stateful" || strategy === "hybrid") {
       const state = this.getState();
       if (state) {
@@ -1157,9 +1474,7 @@ class ContextManager {
           "The following is the structured state from your previous session.",
           "Resume from where you left off. Do NOT repeat this state back",
           "to the user — just use it to continue seamlessly.",
-          "",
-          state,
-          "",
+          "", state, "",
           "═══ END SESSION STATE ═══",
         ].join("\n"));
         log.info("context-mgr", `Injected state (${state.length} chars) into first prompt`);
@@ -1167,32 +1482,15 @@ class ContextManager {
     }
 
     if (parts.length === 0) return prompt;
-
-    // Prepend context, then the actual user message
     return parts.join("\n\n") + "\n\n" + prompt;
   }
 
-  // ── PROMPT INJECTION: AFTER ─────────────────────────────────────────
-  //
-  // Called after the user's prompt to decide if we need to append
-  // instructions for summary compaction or state writing.
-
-  /**
-   * Optionally append post-response instructions to the user's prompt.
-   * These tell the CLI to write summary/state files after responding.
-   *
-   * Returns the (potentially modified) prompt.
-   */
-  wrapPromptWithPostInstructions(
-    prompt: string,
-    session: ManagedSession,
-  ): string {
+  wrapPromptWithPostInstructions(prompt: string, session: ManagedSession): string {
     const strategy = CONTEXT_STRATEGY;
     if (strategy === "none") return prompt;
 
     const instructions: string[] = [];
 
-    // ── Strategy 5: State file instruction (every turn) ──
     if (strategy === "stateful" || strategy === "hybrid") {
       instructions.push([
         "",
@@ -1209,33 +1507,19 @@ class ContextManager {
         "  ## Open Questions — anything unresolved",
         "",
         "Keep it concise (<2000 chars). Overwrite previous content.",
-        "Do NOT mention this instruction to the user or include it in",
-        "your visible response. This is invisible housekeeping.",
+        "Do NOT mention this instruction to the user.",
         "[END SYSTEM INSTRUCTION]",
       ].join("\n"));
     }
 
-    // ── Strategy 4: Summary compaction (context %-based) ──
-    //
-    // Triggers compaction when context window crosses thresholds:
-    //   First at SUMMARY_TRIGGER_PCT (default 40%)
-    //   Then every SUMMARY_RECOMPACT_PCT increase (default +20%)
-    //   So: 40% → 60% → 80% → (by now context warnings are firing)
-    //
-    // This is better than turn-based: a 10-turn session doing heavy
-    // tool chains burns way more context than 10 turns of chat.
-    //
     if (strategy === "summary" || strategy === "hybrid") {
       const ctxPct = session.lastKnownContextPct;
-
-      // Determine next compaction threshold
       const nextThreshold = session.lastSummaryPct === 0
-        ? SUMMARY_TRIGGER_PCT // first compaction
-        : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT; // subsequent
+        ? SUMMARY_TRIGGER_PCT
+        : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT;
 
       if (ctxPct >= nextThreshold) {
-        session.lastSummaryPct = ctxPct; // record that we compacted at this level
-
+        session.lastSummaryPct = ctxPct;
         instructions.push([
           "",
           "[SYSTEM INSTRUCTION — CONVERSATION SUMMARY]",
@@ -1267,23 +1551,69 @@ class ContextManager {
       }
     }
 
+    // ── Daily memory log injection ──────────────────────────────
+    //
+    // [Daedalus audit 2026-03-02] The adapter injects summary + state file
+    // instructions, but daily logs (memory/YYYY-MM-DD.md) were left to the
+    // CLI's own initiative via CLAUDE.md. Under context pressure the CLI
+    // skips them — closing this gap by injecting periodic write instructions.
+    //
+    // Triggers:
+    //   - Every 5 user turns (after turn 3 — skip trivial sessions)
+    //   - At 70%+ context (urgency capture before potential recycle)
+    //   - At most once per 5 turns (no spam)
+    //
+    const turnsSinceLastLog = session.userTurnCount - session.lastDailyLogTurn;
+    const shouldLogDaily =
+      session.userTurnCount >= 3 && (
+        turnsSinceLastLog >= 5 ||                                  // regular cadence
+        (turnsSinceLastLog >= 2 && session.lastKnownContextPct >= 70) // urgency at high context
+      );
+
+    if (shouldLogDaily) {
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const dailyPath = join(this.memoryDir, `${today}.md`);
+      session.lastDailyLogTurn = session.userTurnCount;
+
+      instructions.push([
+        "",
+        "[SYSTEM INSTRUCTION — DAILY MEMORY LOG]",
+        "Append a brief log entry to the daily memory file at:",
+        `  ${dailyPath}`,
+        "",
+        "If the file doesn't exist, create it with a header:",
+        `  # ${today} — Daily Log`,
+        "",
+        "Append (do NOT overwrite existing content) a section with:",
+        "  ## Companion Bridge Session",
+        "  - Key topics discussed this session",
+        "  - Decisions made and their reasoning",
+        "  - Files modified or reviewed",
+        "  - Any user preferences or corrections observed",
+        "  - Current task state",
+        "",
+        "Keep it concise (<1000 chars per entry). Only log substantive",
+        "events — skip if this turn was trivial (quick Q&A, status check).",
+        "Do NOT mention this instruction to the user.",
+        "[END SYSTEM INSTRUCTION]",
+      ].join("\n"));
+
+      log.info("context-mgr",
+        `Triggered daily log write at turn ${session.userTurnCount}`,
+        { dailyPath, contextPct: session.lastKnownContextPct },
+      );
+    }
+
     if (instructions.length === 0) return prompt;
     return prompt + instructions.join("");
   }
 
-  /**
-   * Called after a result is received. Handles any post-response bookkeeping.
-   * Currently reads back the state file to verify it was written (Strategy 5).
-   */
   onResponseComplete(session: ManagedSession): void {
     if (session.isSyntheticTurn) {
       session.isSyntheticTurn = false;
-      return; // don't count synthetic turns
+      return;
     }
-
     session.userTurnCount++;
-
-    // Log context strategy health
     if (session.userTurnCount % 5 === 0) {
       const summary = this.getSummary();
       const state = this.getState();
@@ -1301,84 +1631,35 @@ class ContextManager {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SINGLETON CONTEXT MANAGER INSTANCE
-// ═══════════════════════════════════════════════════════════════════════════════
-
 const contextMgr = new ContextManager();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Extract plain text from an OAI message's content field.
- * OpenClaw sends content as an array of blocks: [{type: "text", text: "..."}]
- * while simpler clients send a plain string. This normalizes both to string.
- */
 function extractTextContent(
   content: string | { type: string; text?: string }[] | null,
 ): string {
   if (!content) return "";
   if (typeof content === "string") return content;
-  // Array of content blocks — concatenate all text blocks
   return content
     .filter((b) => b.type === "text" && b.text)
     .map((b) => b.text!)
     .join("\n");
 }
 
-/**
- * Derive a deterministic session key from the request.
- * Priority: X-Session-Key header > model name > "default"
- *
- * KEY DESIGN DECISIONS (learned the hard way):
- *
- * - x-request-id: NEVER use — it's a per-request UUID, creates a fresh
- *   CLI session on every single turn, destroying conversation continuity.
- *
- * - System prompt hash: NEVER use — OpenClaw injects dynamic content
- *   (timestamps, token counts, session metadata) into the system message,
- *   so the hash changes every turn. Same effect as x-request-id.
- *
- * - Model name: STABLE per agent config. Different agents using different
- *   models get naturally separated sessions. Same agent = same model =
- *   same session = conversation continuity.
- *
- * The CLI session MUST persist across turns so Claude Code can accumulate
- * conversation history internally. Any per-turn variance in the session
- * key causes total amnesia.
- */
 function deriveSessionKey(req: Request, body: OAIChatRequest): string {
-  // ① Explicit session key — client controls session reuse directly.
-  //    OpenClaw can send this header to pin sessions deterministically.
   const hdr = req.headers.get("x-session-key");
   if (hdr) return `key:${hdr}`;
-
-  // ② Model name — stable per agent configuration. Naturally separates
-  //    multi-agent setups (different models → different sessions) while
-  //    keeping the same agent's turns in one persistent session.
   const model = body.model?.trim();
   if (model) return `model:${model}`;
-
-  // ③ Fallback — single shared session (fine for single-agent setups)
   return "default";
 }
 
-/** Words that count as "approved" in tool result messages from the client. */
 const APPROVAL_WORDS = new Set([
-  "approved",
-  "allow",
-  "allowed",
-  "yes",
-  "true",
-  "ok",
-  "accept",
-  "permit",
-  "granted",
+  "approved", "allow", "allowed", "yes", "true", "ok", "accept", "permit", "granted",
 ]);
 
-/** Extract tool approval/denial results from the message history (passthrough mode). */
 function extractToolResults(
   msgs: OAIChatMessage[],
 ): { toolCallId: string; approved: boolean; message: string }[] {
@@ -1389,24 +1670,12 @@ function extractToolResults(
       const approved = APPROVAL_WORDS.has(
         content.toLowerCase().replace(/[^a-z]/g, ""),
       );
-      return {
-        toolCallId: m.tool_call_id!,
-        approved,
-        message: content || "No reason",
-      };
+      return { toolCallId: m.tool_call_id!, approved, message: content || "No reason" };
     });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SSE STREAM FACTORY
-//
-// Creates a real-time Server-Sent Events stream that:
-//   1. Sends heartbeat comments every 5s (prevents HTTP timeout during long tasks)
-//   2. Hooks session.onProgress for live text deltas, tool activity, thinking status
-//   3. Sends OpenAI-format finish chunk + [DONE] on completion
-//   4. Propagates errors as visible text — never fails silently
-//
-// This is the core UX fix: users see exactly what Claude is doing at all times.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function createLiveSSE(
@@ -1423,60 +1692,30 @@ function createLiveSSE(
       const encoder = new TextEncoder();
       let closed = false;
 
-      // Safe write — won't crash if the client disconnected
       const send = (data: string) => {
         if (closed) return;
-        try {
-          controller.enqueue(encoder.encode(data));
-        } catch {
-          closed = true;
-        }
+        try { controller.enqueue(encoder.encode(data)); } catch { closed = true; }
       };
 
-      // SSE chunk helper — tracks whether we've sent the role yet
       let sentRole = false;
       const sendChunk = (content: string) => {
         const delta: Record<string, unknown> = { content };
-        if (!sentRole) {
-          delta.role = "assistant";
-          sentRole = true;
-        }
-        send(
-          `data: ${JSON.stringify({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: session.model,
-            choices: [{ index: 0, delta, finish_reason: null }],
-          })}\n\n`,
-        );
+        if (!sentRole) { delta.role = "assistant"; sentRole = true; }
+        send(`data: ${JSON.stringify({
+          id, object: "chat.completion.chunk", created, model: session.model,
+          choices: [{ index: 0, delta, finish_reason: null }],
+        })}\n\n`);
       };
 
-      // Heartbeat: SSE comment every 5s keeps the connection alive
       const heartbeat = setInterval(() => send(": heartbeat\n\n"), 5000);
-
-      // Optional prefix (e.g. "waiting for previous task...")
       if (prefixFn) prefixFn(sendChunk);
-
-      // Track if we streamed any real content
       let streamed = false;
 
-      // Subscribe to live progress events from the session
       session.onProgress = (evt) => {
-        if (evt.kind === "text_delta" && evt.text) {
-          sendChunk(evt.text);
-          streamed = true;
-        } else if (evt.kind === "tool_start") {
-          sendChunk(`\n\n_${evt.detail}_\n\n`);
-          streamed = true;
-        } else if (evt.kind === "tool_result") {
-          const icon = evt.success ? "✅" : "❌";
-          sendChunk(`_${icon} ${evt.tool} done_\n`);
-          streamed = true;
-        } else if (evt.kind === "thinking") {
-          sendChunk(`\n_🧠 ${evt.status}_\n`);
-          streamed = true;
-        }
+        if (evt.kind === "text_delta" && evt.text) { sendChunk(evt.text); streamed = true; }
+        else if (evt.kind === "tool_start") { sendChunk(`\n\n_${evt.detail}_\n\n`); streamed = true; }
+        else if (evt.kind === "tool_result") { sendChunk(`_${evt.success ? "✅" : "❌"} ${evt.tool} done_\n`); streamed = true; }
+        else if (evt.kind === "thinking") { sendChunk(`\n_🧠 ${evt.status}_\n`); streamed = true; }
       };
 
       try {
@@ -1490,24 +1729,17 @@ function createLiveSSE(
           turns: response.turns,
         });
 
-        // If nothing was streamed yet, send the complete text now
         if (!streamed && response.text) sendChunk(response.text);
 
-        // Finish signal with usage stats
-        send(
-          `data: ${JSON.stringify({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: session.model,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: {
-              prompt_tokens: response.inputTokens,
-              completion_tokens: response.outputTokens,
-              total_tokens: response.inputTokens + response.outputTokens,
-            },
-          })}\n\n`,
-        );
+        send(`data: ${JSON.stringify({
+          id, object: "chat.completion.chunk", created, model: session.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: response.inputTokens,
+            completion_tokens: response.outputTokens,
+            total_tokens: response.inputTokens + response.outputTokens,
+          },
+        })}\n\n`);
         send(`data: [DONE]\n\n`);
       } catch (err) {
         clearInterval(heartbeat);
@@ -1533,144 +1765,69 @@ function createLiveSSE(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// JSON RESPONSE FORMATTER
-// Handles both normal responses and tool passthrough (finish_reason: "tool_calls")
+// JSON RESPONSE FORMATTERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Return a synthetic response for /context commands without hitting the CLI.
- * Supports both streaming (SSE) and non-streaming (JSON) modes so the
- * response renders correctly regardless of how the client is connected.
- */
 function formatCommandResponse(
-  text: string,
-  s: ManagedSession,
-  headers: Record<string, string>,
-  stream: boolean,
+  text: string, s: ManagedSession, headers: Record<string, string>, stream: boolean,
 ): Response {
   const id = `chatcmpl-${randomUUID().slice(0, 8)}`;
   const created = Math.floor(Date.now() / 1000);
 
   if (stream) {
-    // SSE streaming format — send the text as a single delta then [DONE]
     const ssePayload = JSON.stringify({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model: s.model,
+      id, object: "chat.completion.chunk", created, model: s.model,
       choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
     });
     const sseDone = JSON.stringify({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model: s.model,
+      id, object: "chat.completion.chunk", created, model: s.model,
       choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
     });
     const body = `data: ${ssePayload}\n\ndata: ${sseDone}\n\ndata: [DONE]\n\n`;
     return new Response(body, {
-      headers: {
-        ...headers,
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
+      headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
     });
   }
 
-  // Non-streaming JSON format
-  return Response.json(
-    {
-      id,
-      object: "chat.completion",
-      created,
-      model: s.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: text },
-          finish_reason: "stop",
-        },
-      ],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    },
-    { headers },
-  );
+  return Response.json({
+    id, object: "chat.completion", created, model: s.model,
+    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  }, { headers });
 }
 
 function formatJsonResponse(
-  r: SessionResponse,
-  s: ManagedSession,
-  headers: Record<string, string>,
+  r: SessionResponse, s: ManagedSession, headers: Record<string, string>,
 ): Response {
   const id = `chatcmpl-${randomUUID().slice(0, 8)}`;
   const created = Math.floor(Date.now() / 1000);
   const usage = {
-    prompt_tokens: r.inputTokens,
-    completion_tokens: r.outputTokens,
+    prompt_tokens: r.inputTokens, completion_tokens: r.outputTokens,
     total_tokens: r.inputTokens + r.outputTokens,
   };
 
-  // Tool passthrough → return function_calls for the client to decide
   if (r.pendingToolCalls.length > 0) {
     const toolCalls = r.pendingToolCalls.map((p) => ({
-      id: p.toolCallId,
-      type: "function" as const,
-      function: {
-        name: `cc_${p.toolName.toLowerCase()}`,
-        arguments: JSON.stringify(p.input),
-      },
+      id: p.toolCallId, type: "function" as const,
+      function: { name: `cc_${p.toolName.toLowerCase()}`, arguments: JSON.stringify(p.input) },
     }));
-    log.info("adapter", `Returning ${toolCalls.length} tool_calls`, {
-      tools: toolCalls.map((t) => t.function.name),
-    });
-    return Response.json(
-      {
-        id,
-        object: "chat.completion",
-        created,
-        model: s.model,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: "assistant",
-              content: r.text || null,
-              tool_calls: toolCalls,
-            },
-            finish_reason: "tool_calls",
-          },
-        ],
-        usage,
-      },
-      { headers },
-    );
+    log.info("adapter", `Returning ${toolCalls.length} tool_calls`, { tools: toolCalls.map((t) => t.function.name) });
+    return Response.json({
+      id, object: "chat.completion", created, model: s.model,
+      choices: [{ index: 0, message: { role: "assistant", content: r.text || null, tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+      usage,
+    }, { headers });
   }
 
-  // Normal text response
   log.info("adapter", `Response: ${r.text.length} chars`, {
-    tokens: `${r.inputTokens}/${r.outputTokens}`,
-    cost: `$${r.cost.toFixed(4)}`,
-    turns: r.turns,
+    tokens: `${r.inputTokens}/${r.outputTokens}`, cost: `$${r.cost.toFixed(4)}`, turns: r.turns,
   });
 
-  return Response.json(
-    {
-      id,
-      object: "chat.completion",
-      created,
-      model: s.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: r.text },
-          finish_reason: "stop",
-        },
-      ],
-      usage,
-    },
-    { headers },
-  );
+  return Response.json({
+    id, object: "chat.completion", created, model: s.model,
+    choices: [{ index: 0, message: { role: "assistant", content: r.text }, finish_reason: "stop" }],
+    usage,
+  }, { headers });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1685,52 +1842,49 @@ const CORS = {
 };
 
 Bun.serve({
+  hostname: ADAPTER_HOST,
   port: ADAPTER_PORT,
 
   async fetch(req) {
     const url = new URL(req.url);
 
-    // ── CORS preflight ──────────────────────────────────────────────
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ── Health / monitoring ─────────────────────────────────────────
+    // ── Health / monitoring — enriched with lifecycle info (v3.2.0) ──
     if (url.pathname === "/health") {
       return Response.json(
         {
           status: "ok",
           version: PKG_VERSION,
+          bind: `${ADAPTER_HOST}:${ADAPTER_PORT}`,
           companion: COMPANION_URL,
           cwd: SESSION_CWD,
           toolMode: TOOL_MODE,
           permissionMode: PERMISSION_MODE,
           model: MODEL_NAME,
+          resilience: {
+            maxPromptChars: MAX_PROMPT_CHARS,
+            softMaxAgeMs: SESSION_SOFT_MAX_AGE_MS,
+            maxZombieRetries: MAX_ZOMBIE_RETRIES,
+          },
           sessions: pool.listSessions(),
         },
         { headers: CORS },
       );
     }
 
-    // ── Model listing (OpenAI compat) ───────────────────────────────
     if (url.pathname === "/v1/models" && req.method === "GET") {
-      return Response.json(
-        {
-          object: "list",
-          data: [
-            {
-              id: MODEL_NAME,
-              object: "model",
-              created: Math.floor(Date.now() / 1000),
-              owned_by: "companion-bridge",
-            },
-          ],
-        },
-        { headers: CORS },
-      );
+      return Response.json({
+        object: "list",
+        data: [{
+          id: MODEL_NAME, object: "model",
+          created: Math.floor(Date.now() / 1000), owned_by: "companion-bridge",
+        }],
+      }, { headers: CORS });
     }
 
-    // ── Session management ──────────────────────────────────────────
     if (url.pathname.startsWith("/sessions/") && req.method === "DELETE") {
       const key = url.pathname.split("/sessions/")[1];
       if (key) pool.destroySession(key, "manual-delete-api");
@@ -1739,11 +1893,8 @@ Bun.serve({
 
     // ── Chat completions — the main endpoint ────────────────────────
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-      // Parse and validate
       let rawBody: unknown;
-      try {
-        rawBody = await req.json();
-      } catch {
+      try { rawBody = await req.json(); } catch {
         return Response.json(
           { error: { message: "Invalid JSON", type: "invalid_request_error" } },
           { status: 400, headers: CORS },
@@ -1753,9 +1904,7 @@ Bun.serve({
       const validationError = validateChatRequest(rawBody);
       if (validationError) {
         return Response.json(
-          {
-            error: { message: validationError, type: "invalid_request_error" },
-          },
+          { error: { message: validationError, type: "invalid_request_error" } },
           { status: 400, headers: CORS },
         );
       }
@@ -1764,7 +1913,6 @@ Bun.serve({
       const sessionKey = deriveSessionKey(req, body);
       const wantStream = body.stream ?? false;
 
-      // Trace log: session key + context for diagnosing session reuse
       const requestId = req.headers.get("x-request-id");
       const sysMsg = body.messages.find((m) => m.role === "system")?.content ?? "";
       log.info("adapter", `Request → session=${sessionKey}`, {
@@ -1781,12 +1929,7 @@ Bun.serve({
         session = await pool.getSession(sessionKey, body.model);
       } catch (err) {
         return Response.json(
-          {
-            error: {
-              message: err instanceof Error ? err.message : String(err),
-              type: "server_error",
-            },
-          },
+          { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
           { status: 502, headers: CORS },
         );
       }
@@ -1795,15 +1938,8 @@ Bun.serve({
       const toolResults = extractToolResults(body.messages);
       if (toolResults.length > 0 && session.state === "waiting_tool_decision") {
         for (const r of toolResults) {
-          pool.resolveToolPermission(
-            session,
-            r.toolCallId,
-            r.approved,
-            r.message,
-          );
+          pool.resolveToolPermission(session, r.toolCallId, r.approved, r.message);
         }
-
-        // Wait for Claude Code to continue after the tool decisions
         const waitForContinuation = () =>
           new Promise<SessionResponse>((resolve, reject) => {
             session.currentText = "";
@@ -1811,97 +1947,74 @@ Bun.serve({
             session.pendingReject = reject;
             session.state = "busy";
             session.timeoutHandle = setTimeout(() => {
-              reject(
-                new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`),
-              );
+              reject(new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`));
               session.state = "ready";
             }, RESPONSE_TIMEOUT_MS);
           });
 
-        if (wantStream)
-          return createLiveSSE(session, waitForContinuation, CORS);
-        try {
-          return formatJsonResponse(await waitForContinuation(), session, CORS);
-        } catch (err) {
+        if (wantStream) return createLiveSSE(session, waitForContinuation, CORS);
+        try { return formatJsonResponse(await waitForContinuation(), session, CORS); }
+        catch (err) {
           return Response.json(
-            {
-              error: {
-                message: err instanceof Error ? err.message : String(err),
-                type: "server_error",
-              },
-            },
+            { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
             { status: 500, headers: CORS },
           );
         }
       }
 
       // ── Extract the user's prompt ──────────────────────────────
-      // Content can be a plain string OR an array of content blocks
-      // (OpenClaw sends [{type: "text", text: "..."}]). Normalize to string.
-      const rawContent = body.messages
-        .filter((m) => m.role === "user")
-        .at(-1)?.content;
+      const rawContent = body.messages.filter((m) => m.role === "user").at(-1)?.content;
       let prompt = extractTextContent(rawContent);
       if (!prompt) {
         return Response.json(
-          {
-            error: {
-              message: "No user message found",
-              type: "invalid_request_error",
-            },
-          },
+          { error: { message: "No user message found", type: "invalid_request_error" } },
           { status: 400, headers: CORS },
         );
       }
 
-      // ── @bridge commands — runtime context strategy control ────
-      //
-      // Uses "@bridge" prefix — looks like a normal chat message to OpenClaw
-      // so it passes through to the adapter untouched.
-      // OpenClaw intercepts "/" (skills) and "!" (shell), so we avoid both.
-      //
-      // Matching is flexible: we search for @bridge anywhere in the prompt
-      // because OpenClaw prepends timestamps like "[wed 2026-02-18 19:34 gmt-5]"
-      // before the user's actual text.
-      //
-      //   @bridge summary      → switch to rolling summary mode
-      //   @bridge stateful     → switch to external state mode
-      //   @bridge hybrid       → switch to both
-      //   @bridge none         → disable context persistence
-      //   @bridge status       → show current strategy + context health
-      //   @bridge compact      → force a summary compaction now
-      //   @bridge checkpoint   → force a state file write now
-      //   @bridge reset        → destroy session, start fresh (keeps files)
-      //
-      const trimmedPrompt = String(prompt).trim().toLowerCase();
+      // ══════════════════════════════════════════════════════════════
+      // v3.2.0 — PRE-FLIGHT GUARDS (heartbeat isolation + prompt ceiling)
+      // ══════════════════════════════════════════════════════════════
 
-      // Debug: log what the adapter actually receives so we can diagnose
-      // command interception issues. Shows first 300 chars of prompt.
+      // ── GUARD 1: Heartbeat short-circuit ──
+      // Detect monitoring/keepalive prompts and return a canned response
+      // without touching the main conversation context. Prevents the
+      // 48-heartbeat context pollution that caused the 25h session brick.
+      if (isHeartbeatPrompt(prompt)) {
+        return createHeartbeatResponse(prompt, wantStream, CORS);
+      }
+
+      // ── GUARD 2: Prompt size ceiling ──
+      // Reject prompts that would brick the session before they get sent.
+      // The 97KB mesh script on 2026-03-02 would have been caught here.
+      const sizeReject = checkPromptSize(prompt, CORS);
+      if (sizeReject) return sizeReject;
+
+      // ══════════════════════════════════════════════════════════════
+
+      // ── @bridge commands — runtime context strategy control ────
+      const trimmedPrompt = String(prompt).trim().toLowerCase();
       log.info("command", `Prompt received (${trimmedPrompt.length} chars): ${trimmedPrompt.slice(0, 300)}`);
 
-      // Match @bridge anywhere — OpenClaw prepends a timestamp like
-      // "[wed 2026-02-18 19:34 gmt-5] @bridge status" so we can't
-      // rely on start-of-line matching.
       const bridgeMatch = trimmedPrompt.match(/@bridge\b(.*)/);
       if (bridgeMatch) {
         const arg = bridgeMatch[1].trim().split(/\s+/)[0];
 
-        // ── Switch strategy ──
         if (VALID_STRATEGIES.includes(arg as ContextStrategyType)) {
           const prev = CONTEXT_STRATEGY;
           CONTEXT_STRATEGY = arg as ContextStrategyType;
           log.info("command", `Context strategy changed: ${prev} → ${CONTEXT_STRATEGY}`);
-          const msg = `✅ Context strategy switched from **${prev}** to **${CONTEXT_STRATEGY}**.\n\nThis takes effect immediately — no restart needed.`;
-          return formatCommandResponse(msg, session, CORS, wantStream);
+          return formatCommandResponse(
+            `✅ Context strategy switched from **${prev}** to **${CONTEXT_STRATEGY}**.\n\nThis takes effect immediately — no restart needed.`,
+            session, CORS, wantStream,
+          );
         }
 
-        // ── Status ──
         if (arg === "status" || arg === "") {
           const summary = contextMgr.getSummary();
           const state = contextMgr.getState();
           const nextCompact = session.lastSummaryPct === 0
-            ? SUMMARY_TRIGGER_PCT
-            : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT;
+            ? SUMMARY_TRIGGER_PCT : session.lastSummaryPct + SUMMARY_RECOMPACT_PCT;
           const msg = [
             `📊 **Context Strategy:** ${CONTEXT_STRATEGY}`,
             `📈 **Context window:** ${session.lastKnownContextPct}% full`,
@@ -1911,42 +2024,46 @@ Bun.serve({
             `⏱️ **Session turns:** ${session.userTurnCount}`,
             `💰 **Session cost:** $${session.lifetimeCost.toFixed(4)}`,
             `🏷️ **Session key:** ${session.key}`,
+            `📓 **Daily log:** last at turn ${session.lastDailyLogTurn}, next at turn ${Math.max(session.lastDailyLogTurn + 5, 3)}`,
+            `🧟 **Zombie retries:** ${session.zombieRetryCount}`,
+            `♻️ **Should recycle:** ${shouldRecycleSession(session) ? "yes" : "no"}`,
+            `📏 **Max prompt chars:** ${MAX_PROMPT_CHARS.toLocaleString()}`,
           ].join("\n");
           return formatCommandResponse(msg, session, CORS, wantStream);
         }
 
-        // ── Force summary compaction now ──
         if (arg === "compact") {
-          // Reset thresholds so next turn's wrapPromptWithPostInstructions fires
           session.lastSummaryPct = 0;
           session.lastKnownContextPct = SUMMARY_TRIGGER_PCT;
-          const msg = `📝 Summary compaction will trigger on your **next message**.\n\nJust send your next prompt normally — the compaction instruction will be appended automatically.`;
-          return formatCommandResponse(msg, session, CORS, wantStream);
+          return formatCommandResponse(
+            `📝 Summary compaction will trigger on your **next message**.`,
+            session, CORS, wantStream,
+          );
         }
 
-        // ── Force state checkpoint now ──
         if (arg === "checkpoint") {
-          // Temporarily enable state writing if not already active
           const prevStrategy = CONTEXT_STRATEGY;
           if (CONTEXT_STRATEGY === "none" || CONTEXT_STRATEGY === "summary") {
             CONTEXT_STRATEGY = "hybrid";
             log.info("command", `Switched to ${CONTEXT_STRATEGY} for checkpoint (was ${prevStrategy})`);
           }
-          const msg = `📋 State checkpoint will be written on your **next message**.\n\nJust send your next prompt — the CLI will write \`${join(CONTEXT_DIR, ".companion-state.md")}\` after responding.`;
-          return formatCommandResponse(msg, session, CORS, wantStream);
+          return formatCommandResponse(
+            `📋 State checkpoint will be written on your **next message**.`,
+            session, CORS, wantStream,
+          );
         }
 
-        // ── Reset session (keeps context files) ──
         if (arg === "reset") {
           pool.destroySession(sessionKey, "manual-reset-via-chat");
-          const msg = `🔄 Session destroyed. Your context files are preserved:\n- Summary: \`${join(CONTEXT_DIR, ".companion-summary.md")}\`\n- State: \`${join(CONTEXT_DIR, ".companion-state.md")}\`\n\nNext message will start a fresh session with context recovery from these files.`;
-          return formatCommandResponse(msg, session, CORS, wantStream);
+          return formatCommandResponse(
+            `🔄 Session destroyed. Context files preserved.\nNext message starts a fresh session with context recovery.`,
+            session, CORS, wantStream,
+          );
         }
 
-        // ── Help ──
-        const helpMsg = [
-          "**Available @bridge commands:**",
-          "",
+        // Help
+        return formatCommandResponse([
+          "**Available @bridge commands:**", "",
           "`@bridge status` — show current strategy + context health",
           "`@bridge summary` — switch to rolling summary mode",
           "`@bridge stateful` — switch to external state file mode",
@@ -1955,76 +2072,72 @@ Bun.serve({
           "`@bridge compact` — force summary compaction on next turn",
           "`@bridge checkpoint` — force state checkpoint on next turn",
           "`@bridge reset` — kill session, start fresh (keeps context files)",
-        ].join("\n");
-        return formatCommandResponse(helpMsg, session, CORS, wantStream);
+        ].join("\n"), session, CORS, wantStream);
       }
 
       // ── Context Manager: enrich the prompt ─────────────────────
-      // 1. Prepend any recovered context (summary/state) on first turn
-      // 2. Append post-response instructions (state write, summary compaction)
       prompt = contextMgr.wrapPromptWithContext(prompt, session);
       prompt = contextMgr.wrapPromptWithPostInstructions(prompt, session);
 
+      // ══════════════════════════════════════════════════════════════
+      // v3.2.0 — LIFECYCLE CHECK (pre-request)
+      // If the session should be recycled (context full, blind tracker, etc.),
+      // destroy and recreate BEFORE sending the new prompt.
+      // ══════════════════════════════════════════════════════════════
+      if (shouldRecycleSession(session)) {
+        log.info("lifecycle", `Pre-request recycle for session ${sessionKey}`);
+        pool.destroySession(sessionKey, "lifecycle-recycle-pre-request");
+        try {
+          session = await pool.getSession(sessionKey, body.model);
+          // Re-wrap with context recovery since this is now a fresh session
+          prompt = contextMgr.wrapPromptWithContext(
+            extractTextContent(rawContent),
+            session,
+          );
+          prompt = contextMgr.wrapPromptWithPostInstructions(prompt, session);
+        } catch (err) {
+          return Response.json(
+            { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
+            { status: 502, headers: CORS },
+          );
+        }
+      }
+
       // ── Session busy → wait with live progress ─────────────────
-      if (
-        session.state === "busy" ||
-        session.state === "waiting_tool_decision"
-      ) {
-        log.info("adapter", "Session busy, waiting with live progress...", {
-          session: sessionKey,
-        });
+      if (session.state === "busy" || session.state === "waiting_tool_decision") {
+        log.info("adapter", "Session busy, waiting with live progress...", { session: sessionKey });
 
         if (wantStream) {
           return createLiveSSE(
             session,
             async () => {
-              // Poll until the previous task finishes
               while (
-                (session.state === "busy" ||
-                  session.state === "waiting_tool_decision") &&
+                (session.state === "busy" || session.state === "waiting_tool_decision") &&
                 Date.now() - session.lastActivityAt < RESPONSE_TIMEOUT_MS
-              ) {
-                await new Promise((r) => setTimeout(r, 500));
-              }
+              ) { await new Promise((r) => setTimeout(r, 500)); }
 
-              // Recover from dead session
               if (session.state === "dead") {
                 pool.destroySession(sessionKey, "ws-died-during-busy-wait");
                 session = await pool.getSession(sessionKey, body.model);
               } else if (session.state !== "ready") {
-                throw new Error(
-                  "Session timed out while waiting for previous task",
-                );
+                throw new Error("Session timed out while waiting for previous task");
               }
 
               return pool.sendPrompt(session, prompt);
             },
             CORS,
-            (sendStatus) =>
-              sendStatus("⏳ _Previous task still running, waiting..._\n\n"),
+            (sendStatus) => sendStatus("⏳ _Previous task still running, waiting..._\n\n"),
           );
         }
 
-        // Non-streaming busy wait (fallback)
         const waitStart = Date.now();
         while (
-          (session.state === "busy" ||
-            session.state === "waiting_tool_decision") &&
+          (session.state === "busy" || session.state === "waiting_tool_decision") &&
           Date.now() - waitStart < RESPONSE_TIMEOUT_MS
-        ) {
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        if (
-          session.state === "busy" ||
-          session.state === "waiting_tool_decision"
-        ) {
+        ) { await new Promise((r) => setTimeout(r, 500)); }
+        if (session.state === "busy" || session.state === "waiting_tool_decision") {
           return Response.json(
-            {
-              error: {
-                message: "Session still busy after timeout",
-                type: "server_error",
-              },
-            },
+            { error: { message: "Session still busy after timeout", type: "server_error" } },
             { status: 429, headers: CORS },
           );
         }
@@ -2033,22 +2146,26 @@ Bun.serve({
       // ── Dead session → recreate ────────────────────────────────
       if (session.state === "dead") {
         pool.destroySession(sessionKey, "dead-on-new-request");
-        try {
-          session = await pool.getSession(sessionKey, body.model);
-        } catch (err) {
+        try { session = await pool.getSession(sessionKey, body.model); }
+        catch (err) {
           return Response.json(
-            {
-              error: {
-                message: err instanceof Error ? err.message : String(err),
-                type: "server_error",
-              },
-            },
+            { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
             { status: 502, headers: CORS },
           );
         }
       }
 
-      // ── Send the prompt ────────────────────────────────────────
+      // ══════════════════════════════════════════════════════════════
+      // v3.2.0 — SEND WITH ZOMBIE RECOVERY (non-streaming path)
+      //
+      // For SSE: zombie detection happens post-stream. If the stream
+      // completes with a zombie response, the NEXT request's lifecycle
+      // check catches it. The prompt ceiling prevents the worst case
+      // (97k payload) from ever reaching the stream.
+      //
+      // For JSON: full retry logic with session recreation.
+      // ══════════════════════════════════════════════════════════════
+
       if (wantStream) {
         return createLiveSSE(
           session,
@@ -2058,11 +2175,10 @@ Bun.serve({
       }
 
       try {
-        return formatJsonResponse(
-          await pool.sendPrompt(session, prompt),
-          session,
-          CORS,
+        const { result, session: updatedSession } = await sendWithZombieRecovery(
+          sessionKey, session, prompt, body.model ?? MODEL_NAME,
         );
+        return formatJsonResponse(result, updatedSession, CORS);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.error("adapter", msg);
@@ -2073,7 +2189,6 @@ Bun.serve({
       }
     }
 
-    // ── 404 ──────────────────────────────────────────────────────────
     return Response.json(
       { error: { message: "Not found", type: "invalid_request_error" } },
       { status: 404, headers: CORS },
@@ -2089,7 +2204,7 @@ console.log(`
 ╔══════════════════════════════════════════════════════════════╗
 ║  Companion Bridge v${PKG_VERSION.padEnd(40)}║
 ╠══════════════════════════════════════════════════════════════╣
-║  Adapter:     http://localhost:${String(ADAPTER_PORT).padEnd(27)}║
+║  Adapter:     http://${ADAPTER_HOST}:${String(ADAPTER_PORT).padEnd(27 - ADAPTER_HOST.length)}║
 ║  Companion:   ${COMPANION_URL.padEnd(43)}║
 ║  Workspace:   ${SESSION_CWD.slice(-42).padEnd(43)}║
 ║  Model:       ${MODEL_NAME.padEnd(43)}║
@@ -2102,6 +2217,11 @@ console.log(`
 ╠══════════════════════════════════════════════════════════════╣
 ║  Context strategy: ${CONTEXT_STRATEGY.padEnd(38)}║
 ${CONTEXT_STRATEGY !== "none" ? `║  Summary trigger:  ${(SUMMARY_TRIGGER_PCT + "% context (then +" + SUMMARY_RECOMPACT_PCT + "%)").padEnd(38)}║\n║  Context dir:      ${CONTEXT_DIR.slice(-37).padEnd(38)}║` : `║  (no context persistence)                                   ║`}
+╠══════════════════════════════════════════════════════════════╣
+║  Resilience (v3.2.0):                                       ║
+║    Max prompt:   ${(MAX_PROMPT_CHARS.toLocaleString() + " chars").padEnd(40)}║
+║    Soft max age: ${(SESSION_SOFT_MAX_AGE_MS / 3600000 + "h").padEnd(40)}║
+║    Zombie retry: ${String(MAX_ZOMBIE_RETRIES).padEnd(40)}║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Tool policy:                                               ║
 ${toolPolicy
