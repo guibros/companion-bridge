@@ -1,6 +1,6 @@
 {
   "name": "companion-bridge",
-  "version": "3.1.7",
+  "version": "3.2.1",
   "description": "OpenAI-compatible adapter for Claude Code CLI. One command: npx companion-bridge",
   "type": "module",
   "bin": {
@@ -8,10 +8,13 @@
   },
   "scripts": {
     "start": "bun run adapter.ts",
-    "dev": "bun run --watch adapter.ts"
+    "dev": "bun run --watch adapter.ts",
+    "test": "bun test test/harness.test.ts"
   },
   "files": [
     "adapter.ts",
+    "harness.ts",
+    "rules/default.json",
     "bin/companion-bridge.mjs",
     ".env.example",
     "README.md"

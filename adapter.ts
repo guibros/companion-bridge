@@ -32,6 +32,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { getHarness } from "./harness.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PACKAGE VERSION — read from package.json so it never drifts
@@ -510,6 +511,8 @@ interface ManagedSession {
   idleHandle: ReturnType<typeof setTimeout> | null;
   // ── Live streaming callback (set by SSE handler, null otherwise) ──
   onProgress: ((event: ProgressEvent) => void) | null;
+  // ── Harness: carry-forward violation notice to next turn ──
+  pendingViolation: string | null;
 }
 
 interface SessionResponse {
@@ -576,6 +579,7 @@ class SessionPool {
       timeoutHandle: null,
       idleHandle: null,
       onProgress: null,
+      pendingViolation: null,
     };
     this.sessions.set(key, s);
     await this.connectWs(s);
@@ -2078,6 +2082,16 @@ Bun.serve({
       // ── Context Manager: enrich the prompt ─────────────────────
       prompt = contextMgr.wrapPromptWithContext(prompt, session);
       prompt = contextMgr.wrapPromptWithPostInstructions(prompt, session);
+      // ── Harness: carry-forward previous violation (if any) ────────
+      // Save before clearing — needed if recycle rebuilds the prompt below.
+      const savedViolation = session.pendingViolation;
+      if (savedViolation) {
+        prompt = `${savedViolation}\n\n${prompt}`;
+        log.info("harness", "Injected pending violation notice from previous turn");
+        session.pendingViolation = null;
+      }
+      // ── Harness: stamp hard rules into prompt (every turn) ──────
+      prompt = getHarness().injectRules(prompt);
 
       // ══════════════════════════════════════════════════════════════
       // v3.2.0 — LIFECYCLE CHECK (pre-request)
@@ -2095,6 +2109,12 @@ Bun.serve({
             session,
           );
           prompt = contextMgr.wrapPromptWithPostInstructions(prompt, session);
+          // ── Harness: re-inject violation + rules after recycle ──
+          if (savedViolation) {
+            prompt = `${savedViolation}\n\n${prompt}`;
+            log.info("harness", "Re-injected violation notice after session recycle");
+          }
+          prompt = getHarness().injectRules(prompt);
         } catch (err) {
           return Response.json(
             { error: { message: err instanceof Error ? err.message : String(err), type: "server_error" } },
@@ -2178,6 +2198,24 @@ Bun.serve({
         const { result, session: updatedSession } = await sendWithZombieRecovery(
           sessionKey, session, prompt, body.model ?? MODEL_NAME,
         );
+
+        // ── Harness: validate output before surfacing to caller ──
+        // Only runs on the JSON (non-streaming) path. SSE responses are
+        // validated on the next turn's lifecycle check — the inject layer
+        // is the primary enforcement mechanism for streaming responses.
+        const harnessResult = getHarness().validate(result);
+        if (!harnessResult.passed) {
+          const notice = getHarness().formatViolationNotice(harnessResult);
+          log.warn("harness", `Rule violation(s) in response: ${harnessResult.violations.map(v => v.ruleId).join(", ")}`);
+          // Store violation so the soul sees it on the NEXT turn's prompt.
+          // This is the structural self-correction mechanism — the soul can't
+          // avoid seeing the notice because the harness injects it.
+          updatedSession.pendingViolation = notice;
+          // Also surface to the user immediately so they know what happened.
+          const annotated = `⚠️ **Harness: rule violation detected**\n${notice}\n\n---\n\n${result}`;
+          return formatJsonResponse(annotated, updatedSession, CORS);
+        }
+
         return formatJsonResponse(result, updatedSession, CORS);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

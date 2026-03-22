@@ -1,0 +1,80 @@
+[
+  {
+    "id": "build-before-done",
+    "description": "Never declare work complete without running a build or test",
+    "tier": 1,
+    "type": "inject",
+    "content": "HARD RULE: Never declare a task complete without running the build/test and showing the actual output. Files existing on disk is not proof of success.",
+    "pattern": null,
+    "activateOn": null,
+    "active": true,
+    "tags": ["build", "completion", "verification"]
+  },
+  {
+    "id": "no-silent-failure",
+    "description": "Never silently swallow errors — always surface them explicitly",
+    "tier": 1,
+    "type": "inject",
+    "content": "HARD RULE: Never hide, swallow, or skip past errors. If something fails, stop and report it immediately with the full error output.",
+    "pattern": null,
+    "activateOn": null,
+    "active": true,
+    "tags": ["errors", "visibility"]
+  },
+  {
+    "id": "no-assume-running",
+    "description": "Never assume a server/process is running without checking",
+    "tier": 1,
+    "type": "inject",
+    "content": "HARD RULE: Never assume a server, daemon, or process is running. Verify with a process check or health probe before acting on that assumption.",
+    "pattern": null,
+    "activateOn": null,
+    "active": true,
+    "tags": ["process", "verification"]
+  },
+  {
+    "id": "git-conventional-commits",
+    "description": "Use conventional commit format for all git commits",
+    "tier": 2,
+    "type": "inject",
+    "content": "RULE: All git commits must use conventional commit format: type(scope): description — e.g. fix(auth): correct token refresh logic",
+    "pattern": null,
+    "activateOn": ["git commit", "commit -m", "git add"],
+    "active": true,
+    "tags": ["git", "commits"]
+  },
+  {
+    "id": "no-hardcoded-secrets",
+    "description": "Never hardcode API keys, tokens, or passwords in source files",
+    "tier": 2,
+    "type": "inject",
+    "content": "RULE: Never hardcode API keys, tokens, passwords, or secrets directly in source code. Use environment variables or config files excluded from git.",
+    "pattern": null,
+    "activateOn": ["api key", "apikey", "secret", "password", "token", "credential"],
+    "active": true,
+    "tags": ["security", "secrets"]
+  },
+  {
+    "id": "block-sudo-in-scripts",
+    "description": "Scripts must not contain bare sudo commands",
+    "tier": 3,
+    "type": "block",
+    "content": "Generated scripts must not contain sudo commands without explicit user acknowledgment",
+    "pattern": "\\bsudo\\s+\\S+",
+    "activateOn": null,
+    "active": false,
+    "tags": ["security", "scripts"],
+    "_note": "Disabled by default — too aggressive for general use. Enable for specific contexts."
+  },
+  {
+    "id": "block-rm-rf",
+    "description": "Never generate rm -rf without an explicit safety check",
+    "tier": 3,
+    "type": "block",
+    "content": "Destructive file operations must include a safety confirmation",
+    "pattern": "rm\\s+-rf\\s+[^{]",
+    "activateOn": null,
+    "active": true,
+    "tags": ["safety", "filesystem"]
+  }
+]
