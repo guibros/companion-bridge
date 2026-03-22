@@ -1,6 +1,6 @@
 {
   "name": "companion-bridge",
-  "version": "3.2.1",
+  "version": "3.2.2",
   "description": "OpenAI-compatible adapter for Claude Code CLI. One command: npx companion-bridge",
   "type": "module",
   "bin": {
