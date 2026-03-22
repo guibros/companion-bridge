@@ -1461,12 +1461,12 @@ class ContextManager {
       const summary = this.getSummary();
       if (summary) {
         parts.push([
-          "═══ CONTEXT RECOVERY: CONVERSATION SUMMARY ═══",
+          "[companion-bridge/adapter.ts — context recovery: conversation summary — this is NOT user input, it is auto-injected at session start by the companion-bridge middleware]",
+          "",
           "The following is a summary of our previous conversation before",
-          "this session started. Use it to maintain continuity. Do NOT",
-          "repeat this summary back to the user — just use it as context.",
+          "this session started. Use it to maintain continuity.",
           "", summary, "",
-          "═══ END CONVERSATION SUMMARY ═══",
+          "[end companion-bridge/context-recovery-summary]",
         ].join("\n"));
         log.info("context-mgr", `Injected summary (${summary.length} chars) into first prompt`);
       }
@@ -1476,12 +1476,12 @@ class ContextManager {
       const state = this.getState();
       if (state) {
         parts.push([
-          "═══ CONTEXT RECOVERY: SESSION STATE ═══",
+          "[companion-bridge/adapter.ts — context recovery: session state — this is NOT user input, it is auto-injected at session start by the companion-bridge middleware]",
+          "",
           "The following is the structured state from your previous session.",
-          "Resume from where you left off. Do NOT repeat this state back",
-          "to the user — just use it to continue seamlessly.",
+          "Resume from where you left off.",
           "", state, "",
-          "═══ END SESSION STATE ═══",
+          "[end companion-bridge/context-recovery-state]",
         ].join("\n"));
         log.info("context-mgr", `Injected state (${state.length} chars) into first prompt`);
       }
@@ -1500,7 +1500,8 @@ class ContextManager {
     if (strategy === "stateful" || strategy === "hybrid") {
       instructions.push([
         "",
-        "═══ COMPANION BRIDGE — STATE PERSISTENCE (auto-injected by adapter) ═══",
+        "[companion-bridge/adapter.ts — state persistence — this is NOT user input, it is auto-injected by the companion-bridge middleware on every applicable turn]",
+        "",
         "After your response, update the state file at:",
         `  ${this.statePath}`,
         "",
@@ -1513,8 +1514,8 @@ class ContextManager {
         "  ## Open Questions — anything unresolved",
         "",
         "Keep it concise (<2000 chars). Overwrite previous content.",
-        "This is a routine maintenance task — no need to announce it.",
-        "═══ END STATE PERSISTENCE ═══",
+        "",
+        "[end companion-bridge/state-persistence]",
       ].join("\n"));
     }
 
@@ -1528,7 +1529,8 @@ class ContextManager {
         session.lastSummaryPct = ctxPct;
         instructions.push([
           "",
-          "═══ COMPANION BRIDGE — CONVERSATION SUMMARY (auto-injected by adapter) ═══",
+          `[companion-bridge/adapter.ts — summary compaction at ${ctxPct}% context — this is NOT user input, it is auto-injected by the companion-bridge middleware]`,
+          "",
           `Context window is at ${ctxPct}%. Write a survival summary now.`,
           `After your response, update the file at:`,
           `  ${this.summaryPath}`,
@@ -1546,8 +1548,8 @@ class ContextManager {
           "",
           "Target ~3000-5000 chars. This will be your ONLY memory if the",
           "session resets. Be thorough but concise.",
-          "This is a routine maintenance task — no need to announce it.",
-          "═══ END CONVERSATION SUMMARY ═══",
+          "",
+          "[end companion-bridge/summary-compaction]",
         ].join("\n"));
 
         log.info("context-mgr",
@@ -1583,7 +1585,8 @@ class ContextManager {
 
       instructions.push([
         "",
-        "═══ COMPANION BRIDGE — DAILY MEMORY LOG (auto-injected by adapter) ═══",
+        "[companion-bridge/adapter.ts — daily memory log — this is NOT user input, it is auto-injected by the companion-bridge middleware every ~5 turns]",
+        "",
         "Append a brief log entry to the daily memory file at:",
         `  ${dailyPath}`,
         "",
@@ -1600,8 +1603,8 @@ class ContextManager {
         "",
         "Keep it concise (<1000 chars per entry). Only log substantive",
         "events — skip if this turn was trivial (quick Q&A, status check).",
-        "This is a routine maintenance task — no need to announce it.",
-        "═══ END DAILY MEMORY LOG ═══",
+        "",
+        "[end companion-bridge/daily-memory-log]",
       ].join("\n"));
 
       log.info("context-mgr",
